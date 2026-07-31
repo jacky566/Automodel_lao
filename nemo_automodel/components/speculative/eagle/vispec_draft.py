@@ -37,6 +37,8 @@ https://github.com/KangJialiang/ViSpec.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
@@ -47,6 +49,34 @@ from nemo_automodel.components.speculative.eagle.draft_llama_v12 import (
     resolve_attention_bias,
     resolve_fc_bias,
 )
+from nemo_automodel.components.speculative.eagle.msd_decode import (
+    MSDTreeNode,
+    MSDTreeProposal,
+    build_msd_tree_layout,
+)
+
+_DraftKVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
+
+
+@dataclass
+class _VispecDraftCandidate:
+    """One candidate in the cached draft lattice.
+
+    Attributes:
+        candidate_index: Consecutive index in generation order.
+        parent_candidate_index: Parent index, or -1 for a root child.
+        token_id: Draft token vocabulary id.
+        parent_hidden: Tensor of shape [hidden] predicted at the parent.
+        log_probability: Cumulative root-to-node draft log probability.
+        ancestor_cache_indices: Physical draft-cache indices of tree ancestors.
+    """
+
+    candidate_index: int
+    parent_candidate_index: int
+    token_id: int
+    parent_hidden: torch.Tensor
+    log_probability: float
+    ancestor_cache_indices: tuple[int, ...]
 
 
 def apply_vispec_draft_architecture(config: PretrainedConfig) -> None:
@@ -61,7 +91,7 @@ def apply_vispec_draft_architecture(config: PretrainedConfig) -> None:
     therefore produced a materially smaller draft than the paper's, which is not
     a configuration difference a reader of the recipe would notice.
 
-    The three settings cannot be read off the target: HF's ``Qwen2_5_VLTextConfig``
+    These settings cannot be read off the target: HF's ``Qwen2_5_VLTextConfig``
     exposes neither ``attention_bias`` nor ``qkv_bias`` (its attention hard-codes
     the qkv bias inside the module), so there is nothing to inherit. They are
     properties of the ViSpec draft rather than of any one target, and are applied
@@ -77,6 +107,12 @@ def apply_vispec_draft_architecture(config: PretrainedConfig) -> None:
     config.qkv_bias = True
     # Bias on ``fc`` and ``img_fc``, matching the reference's ``bias=True`` default.
     config.fc_bias = True
+    # The reference skips input normalization on layer 0 and has no final norm.
+    config.draft_skip_first_input_norm = True
+    config.draft_apply_final_norm = False
+    # Its attention path uses PyTorch SDPA rather than the common draft's
+    # explicit FP32-softmax implementation.
+    config.draft_use_sdpa_attention = True
 
 
 class VispecImageAdaptor(nn.Module):
@@ -205,7 +241,7 @@ class VispecDraftModel(LlamaEagleDraftModel):
         inputs_embeds: torch.Tensor,
         target_hidden_states: torch.Tensor,
         image_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the compressed draft sequence for one (batch-size-1) sample.
 
         Walks the sample image span by image span. Each span contributes its
@@ -221,12 +257,12 @@ class VispecDraftModel(LlamaEagleDraftModel):
             image_mask: Bool tensor of shape [sequence]; True at image positions.
 
         Returns:
-            Tuple of ``(hidden_states, source_index)``:
+            Tuple of ``(hidden_states, source_index, global_image_feature)``:
             ``hidden_states`` is a Tensor of shape [compressed_sequence, hidden];
             ``source_index`` is a long Tensor of shape [compressed_sequence]
             giving, for each compressed position, its position in the original
-            sequence. It supplies both the draft's position ids and the scatter
-            index that restores the original layout after the decoder stack.
+            sequence; ``global_image_feature`` is a Tensor of shape [1, hidden]
+            retained for subsequent text-only cached decoding.
         """
         seq_len = inputs_embeds.shape[0]
         positions = torch.arange(seq_len, device=inputs_embeds.device)
@@ -275,7 +311,97 @@ class VispecDraftModel(LlamaEagleDraftModel):
             )
         )
         source_index.append(tail_index)
-        return torch.cat(segments, dim=0), torch.cat(source_index, dim=0)
+        return torch.cat(segments, dim=0), torch.cat(source_index, dim=0), global_image_feature
+
+    def _prefill_generation(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        image_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, _DraftKVCache, torch.Tensor]:
+        """Prefill the compressed ViSpec draft cache for one prompt.
+
+        Args:
+            inputs_embeds: Tensor of shape [1, sequence, hidden], shifted to the
+                next-token alignment and ending with the speculative root embedding.
+            target_hidden_states: Tensor of shape [1, sequence, hidden].
+            attention_mask: Tensor of shape [1, sequence].
+            image_mask: Bool tensor of shape [1, sequence], aligned with
+                ``inputs_embeds``.
+
+        Returns:
+            Last hidden state of shape [1, hidden], per-layer K/V tensors of
+            shape [1, kv_heads, compressed_sequence, head_dim], and the global
+            image feature of shape [1, hidden].
+        """
+        if bool(image_mask.any()):
+            hidden_states, source_index, global_image_feature = self._compress_sequence(
+                inputs_embeds[0], target_hidden_states[0], image_mask[0].bool()
+            )
+            hidden_states = hidden_states.unsqueeze(0)
+            position_ids = source_index.unsqueeze(0)
+            compressed_attention_mask = attention_mask[:, source_index]
+        else:
+            global_image_feature = torch.zeros_like(inputs_embeds[0, :1])
+            hidden_states = self._fuse(inputs_embeds[0], target_hidden_states[0], global_image_feature).unsqueeze(0)
+            position_ids = torch.arange(
+                inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device
+            ).unsqueeze(0)
+            compressed_attention_mask = attention_mask
+
+        attention_bias = _build_causal_mask(compressed_attention_mask, hidden_states.dtype)
+        next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in self.layers:
+            hidden_states, layer_cache = layer._forward_cached(
+                hidden_states,
+                attention_bias,
+                position_ids,
+                None,
+            )
+            next_cache.append(layer_cache)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states[:, -1], tuple(next_cache), global_image_feature
+
+    def _decode_generation(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        global_image_feature: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values: _DraftKVCache,
+    ) -> tuple[torch.Tensor, _DraftKVCache]:
+        """Decode cached text or tree nodes through the ViSpec draft.
+
+        Args:
+            inputs_embeds: Tensor of shape [1, query, hidden].
+            target_hidden_states: Tensor of shape [1, query, hidden].
+            global_image_feature: Tensor of shape [1, hidden].
+            position_ids: Long tensor of shape [1, query].
+            attention_mask: Additive tensor of shape [1, 1, query, cached + query].
+            past_key_values: Per-layer K/V tensors of shape
+                [1, kv_heads, cached, head_dim].
+
+        Returns:
+            Hidden states of shape [1, query, hidden] and per-layer K/V tensors
+            of shape [1, kv_heads, cached + query, head_dim].
+        """
+        hidden_states = self._fuse(
+            inputs_embeds[0],
+            target_hidden_states[0],
+            global_image_feature,
+        ).unsqueeze(0)
+        next_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer, layer_cache in zip(self.layers, past_key_values):
+            hidden_states, next_layer_cache = layer._forward_cached(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                layer_cache,
+            )
+            next_cache.append(next_layer_cache)
+        return self.norm(hidden_states), tuple(next_cache)
 
     def forward(
         self,
@@ -317,7 +443,7 @@ class VispecDraftModel(LlamaEagleDraftModel):
         image_mask = image_mask.bool()
 
         if bool(image_mask.any()):
-            hidden_states, source_index = self._compress_sequence(
+            hidden_states, source_index, _ = self._compress_sequence(
                 inputs_embeds[0], target_hidden_states[0], image_mask[0]
             )
             hidden_states = hidden_states.unsqueeze(0)
@@ -353,3 +479,259 @@ class VispecDraftModel(LlamaEagleDraftModel):
             device=hidden_states.device,
         )
         return output.index_copy(1, source_index, hidden_states)
+
+
+class VispecCachedTreeDraftGenerator:
+    """Generate ViSpec trees with a persistent draft KV cache.
+
+    Args:
+        draft_model: ViSpec draft whose inference cache is retained across rounds.
+        target_lm_head: Frozen target language-model head used to score draft features.
+        target_embeddings: Frozen target token embedding module.
+    """
+
+    def __init__(self, draft_model: VispecDraftModel, target_lm_head: nn.Module, target_embeddings: nn.Module) -> None:
+        self.draft_model = draft_model
+        self.target_lm_head = target_lm_head
+        self.target_embeddings = target_embeddings
+        self._stable_cache: _DraftKVCache | None = None
+        self._global_image_feature: torch.Tensor | None = None
+        self._processed_target_tokens = 0
+
+    def reset(self) -> None:
+        """Drop the prompt-specific draft cache before starting another sample."""
+        self._stable_cache = None
+        self._global_image_feature = None
+        self._processed_target_tokens = 0
+
+    @staticmethod
+    def _causal_decode_mask(
+        *,
+        query_length: int,
+        cached_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build an additive mask for cached linear draft decoding.
+
+        Args:
+            query_length: Number of new query tokens.
+            cached_length: Number of existing draft KV entries.
+            dtype: Floating-point mask dtype.
+            device: Device on which to create the mask.
+
+        Returns:
+            Additive tensor of shape [1, 1, query, cached + query].
+        """
+        allowed = torch.ones((query_length, cached_length + query_length), dtype=torch.bool, device=device)
+        allowed[:, cached_length:] = torch.tril(
+            torch.ones((query_length, query_length), dtype=torch.bool, device=device)
+        )
+        mask = torch.zeros((1, 1, query_length, cached_length + query_length), dtype=dtype, device=device)
+        return mask.masked_fill(~allowed.view(1, 1, query_length, -1), torch.finfo(dtype).min)
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        *,
+        shifted_inputs_embeds: torch.Tensor,
+        input_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        shifted_image_mask: torch.Tensor,
+        root_token_id: int,
+        draft_steps: int,
+        top_k: int,
+        beam_width: int,
+    ) -> MSDTreeProposal:
+        """Create a tree using one cached draft forward per tree depth.
+
+        Args:
+            shifted_inputs_embeds: Tensor of shape [1, sequence, hidden], ending
+                with the target-greedy root token embedding.
+            input_hidden_states: Tensor of shape [1, sequence, hidden].
+            attention_mask: Tensor of shape [1, sequence].
+            shifted_image_mask: Bool tensor of shape [1, sequence].
+            root_token_id: Target-greedy token after the cached prefix.
+            draft_steps: Number of drafted tree levels after the root.
+            top_k: Candidate count produced for each live parent.
+            beam_width: Total number of non-root nodes retained for target
+                verification. The live draft frontier retains ``top_k`` nodes.
+
+        Returns:
+            Flattened proposal with tree attention and retrieval tensors.
+        """
+        if draft_steps < 1 or top_k < 1 or beam_width < 1:
+            raise ValueError("draft_steps, top_k, and beam_width must all be positive.")
+        if shifted_inputs_embeds.shape != input_hidden_states.shape:
+            raise ValueError("ViSpec cached draft inputs and hidden states must have matching shapes.")
+        if shifted_inputs_embeds.shape[:2] != attention_mask.shape or attention_mask.shape != shifted_image_mask.shape:
+            raise ValueError("ViSpec cached draft tensors must share matching [1, sequence] dimensions.")
+        if shifted_inputs_embeds.shape[0] != 1:
+            raise ValueError("ViSpec cached tree drafting requires batch size one.")
+
+        root_ids = torch.tensor([[root_token_id]], dtype=torch.long, device=shifted_inputs_embeds.device)
+        shifted_inputs_embeds = shifted_inputs_embeds.clone()
+        shifted_inputs_embeds[:, -1:] = self.target_embeddings(root_ids).to(shifted_inputs_embeds.dtype)
+
+        current_target_tokens = input_hidden_states.shape[1]
+        if self._stable_cache is None:
+            last_hidden, stable_cache, global_image_feature = self.draft_model._prefill_generation(
+                shifted_inputs_embeds,
+                input_hidden_states,
+                attention_mask,
+                shifted_image_mask,
+            )
+            self._stable_cache = stable_cache
+            self._global_image_feature = global_image_feature
+        else:
+            new_tokens = current_target_tokens - self._processed_target_tokens
+            if new_tokens < 1 or self._global_image_feature is None:
+                raise RuntimeError("ViSpec draft cache did not receive a newly accepted target path.")
+            cached_length = self._stable_cache[0][0].shape[-2]
+            decode_mask = self._causal_decode_mask(
+                query_length=new_tokens,
+                cached_length=cached_length,
+                dtype=input_hidden_states.dtype,
+                device=input_hidden_states.device,
+            )
+            position_ids = torch.arange(
+                self._processed_target_tokens,
+                current_target_tokens,
+                dtype=torch.long,
+                device=input_hidden_states.device,
+            ).unsqueeze(0)
+            decoded, self._stable_cache = self.draft_model._decode_generation(
+                shifted_inputs_embeds[:, -new_tokens:],
+                input_hidden_states[:, -new_tokens:],
+                self._global_image_feature,
+                position_ids,
+                decode_mask,
+                self._stable_cache,
+            )
+            last_hidden = decoded[:, -1]
+        self._processed_target_tokens = current_target_tokens
+
+        root_logits = self.target_lm_head(last_hidden)
+        root_log_probs = torch.log_softmax(root_logits, dim=-1)
+        values, token_ids = torch.topk(root_log_probs, k=top_k, dim=-1)
+        candidate_pool: list[_VispecDraftCandidate] = []
+        frontier: list[_VispecDraftCandidate] = []
+        next_candidate_index = 0
+        for value, token_id in zip(values[0], token_ids[0]):
+            token = int(token_id.item())
+            score = float(value.item())
+            candidate = _VispecDraftCandidate(next_candidate_index, -1, token, last_hidden[0], score, ())
+            candidate_pool.append(candidate)
+            frontier.append(candidate)
+            next_candidate_index += 1
+
+        temporary_cache = self._stable_cache
+        stable_length = temporary_cache[0][0].shape[-2]
+        for depth in range(1, draft_steps + 1):
+            query_length = len(frontier)
+            cached_length = temporary_cache[0][0].shape[-2]
+            allowed = torch.zeros(
+                (query_length, cached_length + query_length),
+                dtype=torch.bool,
+                device=input_hidden_states.device,
+            )
+            allowed[:, :stable_length] = True
+            for row, candidate in enumerate(frontier):
+                if candidate.ancestor_cache_indices:
+                    allowed[row, torch.tensor(candidate.ancestor_cache_indices, device=allowed.device)] = True
+                allowed[row, cached_length + row] = True
+            tree_mask = torch.zeros(
+                (1, 1, query_length, cached_length + query_length),
+                dtype=input_hidden_states.dtype,
+                device=input_hidden_states.device,
+            ).masked_fill(~allowed.view(1, 1, query_length, -1), torch.finfo(input_hidden_states.dtype).min)
+            frontier_ids = torch.tensor(
+                [[candidate.token_id for candidate in frontier]],
+                dtype=torch.long,
+                device=input_hidden_states.device,
+            )
+            frontier_embeds = self.target_embeddings(frontier_ids).to(input_hidden_states.dtype)
+            frontier_hidden = torch.stack([candidate.parent_hidden for candidate in frontier], dim=0).unsqueeze(0)
+            position_ids = torch.full(
+                (1, query_length),
+                current_target_tokens + depth - 1,
+                dtype=torch.long,
+                device=input_hidden_states.device,
+            )
+            predicted_hidden, temporary_cache = self.draft_model._decode_generation(
+                frontier_embeds,
+                frontier_hidden,
+                self._global_image_feature,
+                position_ids,
+                tree_mask,
+                temporary_cache,
+            )
+            logits = self.target_lm_head(predicted_hidden[0])
+            log_probs = torch.log_softmax(logits, dim=-1)
+            child_values, child_ids = torch.topk(log_probs, k=top_k, dim=-1)
+            candidates: list[_VispecDraftCandidate] = []
+            for parent_row, parent in enumerate(frontier):
+                physical_parent = cached_length + parent_row
+                for child_rank in range(top_k):
+                    candidate = _VispecDraftCandidate(
+                        next_candidate_index,
+                        parent.candidate_index,
+                        int(child_ids[parent_row, child_rank].item()),
+                        predicted_hidden[0, parent_row],
+                        float(
+                            (
+                                child_values[parent_row, child_rank] + child_values.new_tensor(parent.log_probability)
+                            ).item()
+                        ),
+                        (*parent.ancestor_cache_indices, physical_parent),
+                    )
+                    candidates.append(candidate)
+                    candidate_pool.append(candidate)
+                    next_candidate_index += 1
+            candidates.sort(key=lambda candidate: candidate.log_probability, reverse=True)
+            frontier = candidates[:top_k]
+
+        selected_candidates = sorted(
+            sorted(candidate_pool, key=lambda candidate: candidate.log_probability, reverse=True)[:beam_width],
+            key=lambda candidate: candidate.candidate_index,
+        )
+        final_index_by_candidate = {
+            candidate.candidate_index: final_index for final_index, candidate in enumerate(selected_candidates, start=1)
+        }
+        nodes = [
+            MSDTreeNode(
+                index=final_index_by_candidate[candidate.candidate_index],
+                parent_index=0
+                if candidate.parent_candidate_index < 0
+                else final_index_by_candidate[candidate.parent_candidate_index],
+                token_id=candidate.token_id,
+                depth=self._candidate_depth(candidate, candidate_pool),
+                log_probability=candidate.log_probability,
+            )
+            for candidate in selected_candidates
+        ]
+
+        parent_indices = {node.parent_index for node in nodes}
+        leaf_indices = tuple(node.index for node in nodes if node.index not in parent_indices)
+        layout = build_msd_tree_layout(nodes, leaf_indices, device=input_hidden_states.device)
+        return MSDTreeProposal(root_token_id, tuple(nodes), leaf_indices, layout)
+
+    @staticmethod
+    def _candidate_depth(candidate: _VispecDraftCandidate, candidate_pool: list[_VispecDraftCandidate]) -> int:
+        """Return one candidate's depth in the accumulated draft lattice.
+
+        Args:
+            candidate: Candidate whose ``parent_hidden`` is a Tensor of shape
+                [hidden].
+            candidate_pool: Candidates in generation order; each
+                ``parent_hidden`` is a Tensor of shape [hidden].
+
+        Returns:
+            Candidate depth, with root children at depth one.
+        """
+        depth = 1
+        parent_index = candidate.parent_candidate_index
+        while parent_index >= 0:
+            depth += 1
+            parent_index = candidate_pool[parent_index].parent_candidate_index
+        return depth

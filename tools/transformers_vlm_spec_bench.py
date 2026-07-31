@@ -15,22 +15,24 @@
 """Batch-one Transformers evaluator for Qwen2.5-VL speculative drafts.
 
 The evaluator deliberately uses the same prompt adapter and generation limits
-for baseline, DFlash and ViSpec. It is a correctness/reference evaluator: the
-ViSpec verifier currently re-runs the target for each candidate path, so its
-throughput is not a production serving number.
+for baseline, DFlash and ViSpec. The ViSpec path flattens each candidate tree
+into one target forward, then compacts the accepted path in the target KV cache.
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import json
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PretrainedConfig
+from transformers.cache_utils import DynamicCache
 
 DATASETS = (
     ("gqa", 64),
@@ -39,6 +41,9 @@ DATASETS = (
     ("charxiv_reasoning", 256),
     ("mmmu_pro", 256),
 )
+VISPEC_DEPTH = 3
+VISPEC_TOP_K = 8
+VISPEC_TOTAL_TOKEN = 30
 
 
 def _load_prompt_module():
@@ -99,6 +104,115 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _greedy_cached_forward(
+    target: nn.Module,
+    model_inputs: dict[str, torch.Tensor],
+    *,
+    max_new_tokens: int,
+    eos_token_id: int | None,
+) -> list[int]:
+    """Decode greedily with one persistent target KV cache.
+
+    Args:
+        target: Transformers image-text model whose forward method accepts a
+            ``DynamicCache`` and Qwen-style multimodal position IDs.
+        model_inputs: Processor tensors containing ``input_ids`` and
+            ``attention_mask`` of shape [1, prompt_sequence]. Vision tensors
+            retain the processor-defined flattened patch layouts.
+        max_new_tokens: Maximum number of tokens to generate after the prompt.
+        eos_token_id: Token that terminates decoding after it is emitted, or
+            ``None`` to decode exactly ``max_new_tokens`` tokens.
+
+    Returns:
+        Generated token IDs. The prompt is excluded.
+    """
+    if max_new_tokens < 1:
+        return []
+    input_ids = model_inputs.get("input_ids")
+    prompt_attention_mask = model_inputs.get("attention_mask")
+    if input_ids is None or prompt_attention_mask is None:
+        raise ValueError("Cached target decoding requires input_ids and attention_mask.")
+    if input_ids.shape[0] != 1 or prompt_attention_mask.shape != input_ids.shape:
+        raise ValueError("Cached target decoding requires matching batch-one input ids and attention mask.")
+
+    prompt_length = input_ids.shape[1]
+    cache = DynamicCache()
+    target_kwargs = {key: value for key, value in model_inputs.items() if key != "input_ids"}
+    prefill_kwargs = target.prepare_inputs_for_generation(
+        input_ids,
+        next_sequence_length=prompt_length,
+        past_key_values=cache,
+        is_first_iteration=True,
+        use_cache=True,
+        **target_kwargs,
+    )
+    prefill_input_ids = prefill_kwargs.pop("input_ids")
+    prefill_kwargs["logits_to_keep"] = 1
+    prefill_kwargs["return_dict"] = True
+    outputs = target(prefill_input_ids, **prefill_kwargs)
+    cache = outputs.past_key_values
+    if cache is None or cache.get_seq_length() != prompt_length:
+        actual_length = None if cache is None else cache.get_seq_length()
+        raise RuntimeError(f"Target prefill cache must cover {prompt_length} prompt tokens, got {actual_length}.")
+
+    generated_ids = [int(outputs.logits[:, -1].argmax(dim=-1).item())]
+    target_forward_params = inspect.signature(target.forward).parameters
+    position_hook = getattr(getattr(target, "model", None), "compute_3d_position_ids", None)
+    if not callable(position_hook):
+        raise RuntimeError("Cached target decoding requires compute_3d_position_ids on the target base model.")
+    position_hook_params = inspect.signature(position_hook).parameters
+
+    while len(generated_ids) < max_new_tokens and (eos_token_id is None or generated_ids[-1] != eos_token_id):
+        token_ids = torch.tensor([generated_ids[-1:]], dtype=input_ids.dtype, device=input_ids.device)
+        active_length = prompt_length + len(generated_ids)
+        full_attention_mask = torch.cat(
+            (prompt_attention_mask, prompt_attention_mask.new_ones((1, len(generated_ids)))), dim=1
+        )
+        full_input_ids = torch.cat(
+            (input_ids, torch.tensor([generated_ids], dtype=input_ids.dtype, device=input_ids.device)), dim=1
+        )
+        generation_kwargs = {
+            key: value
+            for key, value in target_kwargs.items()
+            if key not in {"attention_mask", "mm_token_type_ids", "pixel_values", "pixel_values_videos"}
+        }
+        step_kwargs = target.prepare_inputs_for_generation(
+            full_input_ids,
+            next_sequence_length=1,
+            past_key_values=cache,
+            attention_mask=full_attention_mask,
+            is_first_iteration=False,
+            use_cache=True,
+            **generation_kwargs,
+        )
+        step_input_ids = step_kwargs.pop("input_ids")
+        step_kwargs["attention_mask"] = full_attention_mask
+        position_kwargs: dict[str, object] = {
+            "input_ids": token_ids,
+            "image_grid_thw": None,
+            "video_grid_thw": None,
+            "inputs_embeds": target.get_input_embeddings()(token_ids),
+            "attention_mask": full_attention_mask,
+            "past_key_values": cache,
+            "second_per_grid_ts": None,
+            "mm_token_type_ids": None,
+        }
+        step_kwargs["position_ids"] = position_hook(
+            **{key: value for key, value in position_kwargs.items() if key in position_hook_params}
+        )[..., -1:]
+        if "cache_position" in target_forward_params:
+            step_kwargs["cache_position"] = torch.tensor([active_length - 1], dtype=torch.long, device=input_ids.device)
+        step_kwargs["logits_to_keep"] = 1
+        step_kwargs["return_dict"] = True
+        outputs = target(step_input_ids, **step_kwargs)
+        cache = outputs.past_key_values
+        if cache is None or cache.get_seq_length() != active_length:
+            actual_length = None if cache is None else cache.get_seq_length()
+            raise RuntimeError(f"Target decode cache must cover {active_length} processed tokens, got {actual_length}.")
+        generated_ids.append(int(outputs.logits[:, -1].argmax(dim=-1).item()))
+    return generated_ids
+
+
 @torch.inference_mode()
 def _baseline(
     target,
@@ -108,35 +222,30 @@ def _baseline(
     device: torch.device,
     fixed_output_length: bool = False,
 ) -> dict[str, Any]:
-    """Run greedy target generation and report output-token throughput."""
+    """Run one-token cached target forwards and report output-token throughput."""
     output_tokens = 0
     reference_outputs: list[list[int]] = []
+    eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
     if prompts:
         warmup_inputs = _prepare_inputs(processor, prompts[0], device)
-        target.generate(
-            **warmup_inputs,
+        _greedy_cached_forward(
+            target,
+            warmup_inputs,
             max_new_tokens=min(8, max_new_tokens),
-            do_sample=False,
-            repetition_penalty=1.0,
-            use_cache=True,
+            eos_token_id=eos_token_id,
         )
     _sync(device)
     start = time.perf_counter()
     for prompt_index, prompt in enumerate(prompts):
         inputs = _prepare_inputs(processor, prompt, device)
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-            "repetition_penalty": 1.0,
-            "use_cache": True,
-        }
-        output = target.generate(
-            **inputs,
-            **generation_kwargs,
+        generated = _greedy_cached_forward(
+            target,
+            inputs,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
         )
-        generated = output[0, inputs["input_ids"].shape[1] :]
-        output_tokens += int(generated.numel())
-        reference_outputs.append(generated.tolist())
+        output_tokens += len(generated)
+        reference_outputs.append(generated)
     _sync(device)
     wall = time.perf_counter() - start
     return {
@@ -275,7 +384,7 @@ def _dflash(
 def _load_vispec(path: str, target, device: torch.device):
     from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraftModel
 
-    config = PretrainedConfig.from_pretrained(path)
+    config = PretrainedConfig.from_dict(json.loads((Path(path) / "config.json").read_text()))
     if getattr(config, "architectures", []) != ["VispecDraftModel"]:
         raise ValueError(
             "ViSpec evaluator expects a NeMo consolidated checkpoint with architectures=['VispecDraftModel']; "
@@ -297,79 +406,83 @@ def _load_vispec(path: str, target, device: torch.device):
 
 @torch.inference_mode()
 def _vispec(
-    target, processor, draft, prompts, max_new_tokens: int, device: torch.device, reference_outputs=None
+    target,
+    processor,
+    draft,
+    prompts,
+    max_new_tokens: int,
+    device: torch.device,
+    reference_outputs=None,
+    fixed_output_length: bool = False,
 ) -> dict[str, Any]:
-    """Run one-at-a-time ViSpec/MSD rounds with the HF tree verifier."""
-    from nemo_automodel.components.speculative.eagle.msd_decode import MSDGreedyDecoder
+    """Run batch-one ViSpec/MSD rounds with cached target verification."""
+    from nemo_automodel.components.speculative.eagle.vispec_decode import VispecCachedGreedyDecoder
     from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
 
     image_token_id = int(getattr(target.config, "image_token_id"))
     vispec_target = HFVispecTargetModel(target, image_token_id=image_token_id)
 
-    class _MSDTargetAdapter:
-        """Adapt the ViSpec target wrapper to the generic MSD decoder contract."""
-
-        def __init__(self, wrapped_target):
-            self._wrapped_target = wrapped_target
-            self.model = wrapped_target.model
-
-        def get_lm_head(self):
-            return self._wrapped_target.get_lm_head()
-
-        def generate_batch(self, *, loss_mask, model_inputs):
-            input_ids = model_inputs["input_ids"]
-            attention_mask = model_inputs["attention_mask"]
-            multimodal_inputs = {
-                key: value
-                for key, value in model_inputs.items()
-                if key not in {"input_ids", "attention_mask", "labels", "position_ids"}
-            }
-            return self._wrapped_target.generate_batch(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                loss_mask=loss_mask,
-                **multimodal_inputs,
-            )
-
-    target_wrapper = _MSDTargetAdapter(vispec_target)
-    decoder = MSDGreedyDecoder(target_wrapper, draft)
+    decoder = VispecCachedGreedyDecoder(vispec_target, draft)
     output_tokens = 0
     draft_tokens = 0
     accepted_tokens = 0
     verify_steps = 0
     exact_matches = 0
+    matching_tokens = 0
+    compared_tokens = 0
+    common_prefix_tokens = 0
+    if prompts:
+        warmup_inputs = _prepare_inputs(processor, prompts[0], device)
+        decoder.prefill(warmup_inputs)
+        decoder.decode_round(
+            draft_steps=VISPEC_DEPTH,
+            top_k=VISPEC_TOP_K,
+            beam_width=VISPEC_TOTAL_TOKEN - 1,
+        )
     _sync(device)
     start = time.perf_counter()
     for prompt_index, prompt in enumerate(prompts):
         model_inputs = _prepare_inputs(processor, prompt, device)
+        decoder.prefill(model_inputs)
+        sample_max_new_tokens = (
+            len(reference_outputs[prompt_index])
+            if fixed_output_length and reference_outputs is not None
+            else max_new_tokens
+        )
         generated = 0
-        while generated < max_new_tokens:
+        generated_ids: list[int] = []
+        while generated < sample_max_new_tokens:
             proposal, result = decoder.decode_round(
-                model_inputs=model_inputs,
-                draft_steps=3,
-                top_k=4,
-                beam_width=4,
+                draft_steps=VISPEC_DEPTH,
+                top_k=VISPEC_TOP_K,
+                beam_width=VISPEC_TOTAL_TOKEN - 1,
             )
-            emitted = (*result.accepted_token_ids, result.bonus_token_id)
-            emitted = emitted[: max_new_tokens - generated]
+            emitted = list(result.accepted_token_ids[: sample_max_new_tokens - generated])
+            eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
+            if not fixed_output_length and eos_token_id in emitted:
+                emitted = emitted[: emitted.index(eos_token_id) + 1]
             if not emitted:
                 break
-            emitted_ids = torch.tensor([emitted], dtype=model_inputs["input_ids"].dtype, device=device)
-            model_inputs["input_ids"] = torch.cat((model_inputs["input_ids"], emitted_ids), dim=1)
-            model_inputs["attention_mask"] = torch.ones_like(model_inputs["input_ids"])
-            if "mm_token_type_ids" in model_inputs:
-                suffix = torch.zeros_like(emitted_ids, dtype=model_inputs["mm_token_type_ids"].dtype)
-                model_inputs["mm_token_type_ids"] = torch.cat((model_inputs["mm_token_type_ids"], suffix), dim=1)
+            generated_ids.extend(emitted)
             generated += len(emitted)
             output_tokens += len(emitted)
             draft_tokens += len(proposal.nodes)
-            accepted_tokens += result.accepted_draft_tokens
+            accepted_tokens += min(result.accepted_draft_tokens, max(0, len(emitted) - 1))
             verify_steps += 1
-            if result.bonus_token_id == getattr(processor.tokenizer, "eos_token_id", -1):
+            if not fixed_output_length and eos_token_id in emitted:
                 break
         if reference_outputs is not None:
-            generated_ids = model_inputs["input_ids"][0, -generated:].tolist() if generated else []
-            exact_matches += int(generated_ids == reference_outputs[prompt_index])
+            reference_ids = reference_outputs[prompt_index]
+            exact_matches += int(generated_ids == reference_ids)
+            compared_length = min(len(generated_ids), len(reference_ids))
+            matching_tokens += sum(
+                generated_ids[token_index] == reference_ids[token_index] for token_index in range(compared_length)
+            )
+            compared_tokens += max(len(generated_ids), len(reference_ids))
+            for generated_id, reference_id in zip(generated_ids, reference_ids):
+                if generated_id != reference_id:
+                    break
+                common_prefix_tokens += 1
     _sync(device)
     wall = time.perf_counter() - start
     return {
@@ -381,6 +494,12 @@ def _vispec(
         "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
         "exact_match_count": exact_matches if reference_outputs is not None else None,
         "exact_match_rate": exact_matches / len(prompts) if reference_outputs is not None and prompts else None,
+        "token_match_rate": matching_tokens / compared_tokens
+        if reference_outputs is not None and compared_tokens
+        else None,
+        "mean_common_prefix_length": common_prefix_tokens / len(prompts)
+        if reference_outputs is not None and prompts
+        else None,
     }
 
 
@@ -459,6 +578,7 @@ def main() -> None:
                 max_new_tokens,
                 device,
                 reference_outputs,
+                fixed_output_length=args.fixed_output_length,
             )
         if args.mode == "baseline":
             result.pop("_reference_outputs", None)
@@ -472,7 +592,12 @@ def main() -> None:
             "block_size": args.block_size if args.mode == "dflash" else None,
             "draft_layers": args.draft_layers if args.mode == "dflash" else None,
             "attn_implementation": args.attn_implementation,
-            "verification_mode": args.verification_mode if args.mode == "dflash" else None,
+            "verification_mode": args.verification_mode
+            if args.mode == "dflash"
+            else ("tree" if args.mode == "vispec" else None),
+            "vispec_depth": VISPEC_DEPTH if args.mode == "vispec" else None,
+            "vispec_top_k": VISPEC_TOP_K if args.mode == "vispec" else None,
+            "vispec_total_token": VISPEC_TOTAL_TOKEN if args.mode == "vispec" else None,
             **result,
         }
         print(json.dumps({name: results[name]}, indent=2), flush=True)
