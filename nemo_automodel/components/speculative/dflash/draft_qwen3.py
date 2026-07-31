@@ -30,10 +30,12 @@ mask that enforces this is built by the trainer wrapper in
 from __future__ import annotations
 
 import inspect
+from contextlib import AbstractContextManager, nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -137,17 +139,25 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attn_output, attn_weights = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+        backend_context = nullcontext()
+        if not self.training and q.device.type == "cuda" and self.config._attn_implementation == "sdpa":
+            # DFlash changes the cached context length after nearly every block.
+            # cuDNN SDPA repeatedly plans those dynamic shapes, while efficient
+            # attention supports the same additive non-causal block mask without
+            # that host overhead. Keep math enabled for older CUDA architectures.
+            backend_context = sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+        with backend_context:
+            attn_output, attn_weights = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
         attn_output = attn_output.reshape(bsz, q_len, -1)
         return self.o_proj(attn_output), attn_weights
 
@@ -396,6 +406,19 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             end_event.record()
             timing_events[phase].append((start_event, end_event))
 
+        def target_verify_backend() -> AbstractContextManager[None]:
+            target_config = getattr(target, "config", None)
+            if (
+                target.device.type == "cuda"
+                and target_config is not None
+                and getattr(target_config, "_attn_implementation", None) == "sdpa"
+            ):
+                # Verification repeatedly changes the cached sequence length.
+                # Avoid cuDNN SDPA plan construction for those short dynamic
+                # blocks while leaving the long target prefill unchanged.
+                return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+            return nullcontext()
+
         # Prefill the target on the prompt.
         if target_is_vlm:
             prefill_kwargs = target.prepare_inputs_for_generation(
@@ -512,7 +535,8 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                         }
                     verify_kwargs["output_hidden_states"] = True
                     phase_start = start_timing()
-                    step_output = target(verify_input_ids, **verify_kwargs)
+                    with target_verify_backend():
+                        step_output = target(verify_input_ids, **verify_kwargs)
                     end_timing("target_verify", phase_start)
                     step_posterior = sample(step_output.logits[:, -1:], temperature)
                     posterior_tokens.append(step_posterior)
@@ -591,7 +615,8 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 verify_kwargs["position_ids"] = block_position_ids
             if not sequential_target_verification:
                 phase_start = start_timing()
-                output = target(verify_input_ids, **verify_kwargs)
+                with target_verify_backend():
+                    output = target(verify_input_ids, **verify_kwargs)
                 end_timing("target_verify", phase_start)
                 posterior = sample(output.logits, temperature)
                 acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()

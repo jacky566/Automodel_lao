@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from tools.transformers_vlm_spec_bench import _greedy_cached_forward
+from tools.transformers_vlm_spec_bench import _acceptance_lengths, _greedy_cached_forward
 
 
 class _TinyPositionModel(nn.Module):
@@ -152,3 +152,9 @@ def test_greedy_cached_forward_reuses_cache_and_decodes_one_token_at_a_time() ->
     assert target.query_lengths == [2, 1, 1]
     assert len(set(target.cache_ids)) == 1
     assert target.cache_positions == [None, [2], [3]]
+
+
+def test_acceptance_lengths_separates_official_tau_from_emitted_tokens() -> None:
+    """Official tau excludes the one guaranteed target token emitted per round."""
+    assert _acceptance_lengths(9, 4) == (2.25, 3.25)
+    assert _acceptance_lengths(0, 0) == (None, None)

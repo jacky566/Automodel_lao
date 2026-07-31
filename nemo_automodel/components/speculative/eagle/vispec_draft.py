@@ -37,8 +37,6 @@ https://github.com/KangJialiang/ViSpec.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
@@ -50,33 +48,13 @@ from nemo_automodel.components.speculative.eagle.draft_llama_v12 import (
     resolve_fc_bias,
 )
 from nemo_automodel.components.speculative.eagle.msd_decode import (
+    MSDTreeLayout,
     MSDTreeNode,
     MSDTreeProposal,
     build_msd_tree_layout,
 )
 
 _DraftKVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
-
-
-@dataclass
-class _VispecDraftCandidate:
-    """One candidate in the cached draft lattice.
-
-    Attributes:
-        candidate_index: Consecutive index in generation order.
-        parent_candidate_index: Parent index, or -1 for a root child.
-        token_id: Draft token vocabulary id.
-        parent_hidden: Tensor of shape [hidden] predicted at the parent.
-        log_probability: Cumulative root-to-node draft log probability.
-        ancestor_cache_indices: Physical draft-cache indices of tree ancestors.
-    """
-
-    candidate_index: int
-    parent_candidate_index: int
-    token_id: int
-    parent_hidden: torch.Tensor
-    log_probability: float
-    ancestor_cache_indices: tuple[int, ...]
 
 
 def apply_vispec_draft_architecture(config: PretrainedConfig) -> None:
@@ -613,22 +591,21 @@ class VispecCachedTreeDraftGenerator:
 
         root_logits = self.target_lm_head(last_hidden)
         root_log_probs = torch.log_softmax(root_logits, dim=-1)
-        values, token_ids = torch.topk(root_log_probs, k=top_k, dim=-1)
-        candidate_pool: list[_VispecDraftCandidate] = []
-        frontier: list[_VispecDraftCandidate] = []
-        next_candidate_index = 0
-        for value, token_id in zip(values[0], token_ids[0]):
-            token = int(token_id.item())
-            score = float(value.item())
-            candidate = _VispecDraftCandidate(next_candidate_index, -1, token, last_hidden[0], score, ())
-            candidate_pool.append(candidate)
-            frontier.append(candidate)
-            next_candidate_index += 1
+        frontier_scores, frontier_token_ids = torch.topk(root_log_probs[0], k=top_k, dim=-1)
+        frontier_candidate_indices = torch.arange(top_k, dtype=torch.long, device=input_hidden_states.device)
+        frontier_parent_hidden = last_hidden.expand(top_k, -1)
+        frontier_ancestor_cache_indices = torch.empty((top_k, 0), dtype=torch.long, device=input_hidden_states.device)
+        pool_candidate_indices = [frontier_candidate_indices]
+        pool_parent_indices = [torch.full_like(frontier_candidate_indices, -1)]
+        pool_token_ids = [frontier_token_ids]
+        pool_scores = [frontier_scores]
+        pool_depths = [torch.ones_like(frontier_candidate_indices)]
+        next_candidate_index = top_k
 
         temporary_cache = self._stable_cache
         stable_length = temporary_cache[0][0].shape[-2]
         for depth in range(1, draft_steps + 1):
-            query_length = len(frontier)
+            query_length = frontier_candidate_indices.numel()
             cached_length = temporary_cache[0][0].shape[-2]
             allowed = torch.zeros(
                 (query_length, cached_length + query_length),
@@ -636,22 +613,19 @@ class VispecCachedTreeDraftGenerator:
                 device=input_hidden_states.device,
             )
             allowed[:, :stable_length] = True
-            for row, candidate in enumerate(frontier):
-                if candidate.ancestor_cache_indices:
-                    allowed[row, torch.tensor(candidate.ancestor_cache_indices, device=allowed.device)] = True
-                allowed[row, cached_length + row] = True
+            frontier_rows = torch.arange(query_length, device=allowed.device)
+            if frontier_ancestor_cache_indices.shape[1] > 0:
+                ancestor_rows = frontier_rows[:, None].expand_as(frontier_ancestor_cache_indices)
+                allowed[ancestor_rows, frontier_ancestor_cache_indices] = True
+            allowed[frontier_rows, cached_length + frontier_rows] = True
             tree_mask = torch.zeros(
                 (1, 1, query_length, cached_length + query_length),
                 dtype=input_hidden_states.dtype,
                 device=input_hidden_states.device,
             ).masked_fill(~allowed.view(1, 1, query_length, -1), torch.finfo(input_hidden_states.dtype).min)
-            frontier_ids = torch.tensor(
-                [[candidate.token_id for candidate in frontier]],
-                dtype=torch.long,
-                device=input_hidden_states.device,
-            )
+            frontier_ids = frontier_token_ids.unsqueeze(0)
             frontier_embeds = self.target_embeddings(frontier_ids).to(input_hidden_states.dtype)
-            frontier_hidden = torch.stack([candidate.parent_hidden for candidate in frontier], dim=0).unsqueeze(0)
+            frontier_hidden = frontier_parent_hidden.unsqueeze(0)
             position_ids = torch.full(
                 (1, query_length),
                 current_target_tokens + depth - 1,
@@ -669,69 +643,84 @@ class VispecCachedTreeDraftGenerator:
             logits = self.target_lm_head(predicted_hidden[0])
             log_probs = torch.log_softmax(logits, dim=-1)
             child_values, child_ids = torch.topk(log_probs, k=top_k, dim=-1)
-            candidates: list[_VispecDraftCandidate] = []
-            for parent_row, parent in enumerate(frontier):
-                physical_parent = cached_length + parent_row
-                for child_rank in range(top_k):
-                    candidate = _VispecDraftCandidate(
-                        next_candidate_index,
-                        parent.candidate_index,
-                        int(child_ids[parent_row, child_rank].item()),
-                        predicted_hidden[0, parent_row],
-                        float(
-                            (
-                                child_values[parent_row, child_rank] + child_values.new_tensor(parent.log_probability)
-                            ).item()
-                        ),
-                        (*parent.ancestor_cache_indices, physical_parent),
-                    )
-                    candidates.append(candidate)
-                    candidate_pool.append(candidate)
-                    next_candidate_index += 1
-            candidates.sort(key=lambda candidate: candidate.log_probability, reverse=True)
-            frontier = candidates[:top_k]
-
-        selected_candidates = sorted(
-            sorted(candidate_pool, key=lambda candidate: candidate.log_probability, reverse=True)[:beam_width],
-            key=lambda candidate: candidate.candidate_index,
-        )
-        final_index_by_candidate = {
-            candidate.candidate_index: final_index for final_index, candidate in enumerate(selected_candidates, start=1)
-        }
-        nodes = [
-            MSDTreeNode(
-                index=final_index_by_candidate[candidate.candidate_index],
-                parent_index=0
-                if candidate.parent_candidate_index < 0
-                else final_index_by_candidate[candidate.parent_candidate_index],
-                token_id=candidate.token_id,
-                depth=self._candidate_depth(candidate, candidate_pool),
-                log_probability=candidate.log_probability,
+            candidate_count = query_length * top_k
+            candidate_indices = torch.arange(
+                next_candidate_index,
+                next_candidate_index + candidate_count,
+                dtype=torch.long,
+                device=input_hidden_states.device,
             )
-            for candidate in selected_candidates
-        ]
+            candidate_parent_indices = frontier_candidate_indices.repeat_interleave(top_k)
+            candidate_token_ids = child_ids.reshape(-1)
+            candidate_scores = (child_values + frontier_scores[:, None]).reshape(-1)
+            candidate_parent_hidden = predicted_hidden[0].repeat_interleave(top_k, dim=0)
+            physical_parents = cached_length + frontier_rows
+            candidate_ancestor_cache_indices = torch.cat(
+                (
+                    frontier_ancestor_cache_indices.repeat_interleave(top_k, dim=0),
+                    physical_parents.repeat_interleave(top_k).unsqueeze(1),
+                ),
+                dim=1,
+            )
+            pool_candidate_indices.append(candidate_indices)
+            pool_parent_indices.append(candidate_parent_indices)
+            pool_token_ids.append(candidate_token_ids)
+            pool_scores.append(candidate_scores)
+            pool_depths.append(torch.full_like(candidate_indices, depth + 1))
+            next_candidate_index += candidate_count
+
+            frontier_order = torch.argsort(candidate_scores, descending=True, stable=True)[:top_k]
+            frontier_candidate_indices = candidate_indices.index_select(0, frontier_order)
+            frontier_token_ids = candidate_token_ids.index_select(0, frontier_order)
+            frontier_scores = candidate_scores.index_select(0, frontier_order)
+            frontier_parent_hidden = candidate_parent_hidden.index_select(0, frontier_order)
+            frontier_ancestor_cache_indices = candidate_ancestor_cache_indices.index_select(0, frontier_order)
+
+        all_candidate_indices = torch.cat(pool_candidate_indices)
+        all_parent_indices = torch.cat(pool_parent_indices)
+        all_token_ids = torch.cat(pool_token_ids)
+        all_scores = torch.cat(pool_scores)
+        all_depths = torch.cat(pool_depths)
+        selected_order = torch.argsort(all_scores, descending=True, stable=True)[:beam_width]
+        selected_order = selected_order.index_select(0, torch.argsort(all_candidate_indices[selected_order]))
+        selected_metadata = (
+            torch.stack(
+                (
+                    all_candidate_indices[selected_order],
+                    all_parent_indices[selected_order],
+                    all_token_ids[selected_order],
+                    all_depths[selected_order],
+                ),
+                dim=1,
+            )
+            .cpu()
+            .tolist()
+        )
+        selected_scores = all_scores[selected_order].float().cpu().tolist()
+        final_index_by_candidate = {
+            candidate_index: final_index
+            for final_index, (candidate_index, _, _, _) in enumerate(selected_metadata, start=1)
+        }
+        nodes = []
+        for final_index, ((_, parent_candidate_index, token_id, candidate_depth), score) in enumerate(
+            zip(selected_metadata, selected_scores, strict=True), start=1
+        ):
+            nodes.append(
+                MSDTreeNode(
+                    index=final_index,
+                    parent_index=0 if parent_candidate_index < 0 else final_index_by_candidate[parent_candidate_index],
+                    token_id=token_id,
+                    depth=candidate_depth,
+                    log_probability=score,
+                )
+            )
 
         parent_indices = {node.parent_index for node in nodes}
         leaf_indices = tuple(node.index for node in nodes if node.index not in parent_indices)
-        layout = build_msd_tree_layout(nodes, leaf_indices, device=input_hidden_states.device)
+        cpu_layout = build_msd_tree_layout(nodes, leaf_indices, device=torch.device("cpu"))
+        layout = MSDTreeLayout(
+            attention_mask=cpu_layout.attention_mask.to(input_hidden_states.device),
+            position_ids=cpu_layout.position_ids.to(input_hidden_states.device),
+            retrieve_indices=cpu_layout.retrieve_indices.to(input_hidden_states.device),
+        )
         return MSDTreeProposal(root_token_id, tuple(nodes), leaf_indices, layout)
-
-    @staticmethod
-    def _candidate_depth(candidate: _VispecDraftCandidate, candidate_pool: list[_VispecDraftCandidate]) -> int:
-        """Return one candidate's depth in the accumulated draft lattice.
-
-        Args:
-            candidate: Candidate whose ``parent_hidden`` is a Tensor of shape
-                [hidden].
-            candidate_pool: Candidates in generation order; each
-                ``parent_hidden`` is a Tensor of shape [hidden].
-
-        Returns:
-            Candidate depth, with root children at depth one.
-        """
-        depth = 1
-        parent_index = candidate.parent_candidate_index
-        while parent_index >= 0:
-            depth += 1
-            parent_index = candidate_pool[parent_index].parent_candidate_index
-        return depth

@@ -581,14 +581,18 @@ def test_cached_vispec_decoder_commits_accepted_path_and_defers_bonus() -> None:
 
 
 def test_vispec_tree_commit_compacts_selected_dynamic_cache_positions() -> None:
-    """Tree commit retains only selected K/V entries in accepted-path order."""
+    """Tree commit reuses storage and retains selected K/V entries in path order."""
     cache = DynamicCache()
     prefix_keys = torch.tensor([[[[1.0], [2.0]]]])
     prefix_values = prefix_keys + 10.0
     cache.update(prefix_keys, prefix_values, 0)
+    wrapper = object.__new__(HFVispecTargetModel)
+    wrapper._preallocate_generation_cache(cache)
+    storage_pointer = cache.layers[0].keys.untyped_storage().data_ptr()
     tree_keys = torch.tensor([[[[3.0], [4.0], [5.0]]]])
     tree_values = tree_keys + 10.0
     cache.update(tree_keys, tree_values, 0)
+    assert cache.layers[0].keys.untyped_storage().data_ptr() == storage_pointer
     state = VispecGenerationState(
         input_ids=torch.tensor([[7, 8]]),
         attention_mask=torch.ones(1, 2),
@@ -605,8 +609,6 @@ def test_vispec_tree_commit_compacts_selected_dynamic_cache_positions() -> None:
         logits=torch.arange(48, dtype=torch.float32).view(1, 3, 16),
         prefix_length=2,
     )
-    wrapper = object.__new__(HFVispecTargetModel)
-
     committed = wrapper.commit_tree_generation(
         state,
         tree_output,
@@ -617,4 +619,5 @@ def test_vispec_tree_commit_compacts_selected_dynamic_cache_positions() -> None:
     assert committed.past_key_values.get_seq_length() == 4
     assert committed.past_key_values.layers[0].keys.flatten().tolist() == [1.0, 2.0, 3.0, 5.0]
     assert committed.past_key_values.layers[0].values.flatten().tolist() == [11.0, 12.0, 13.0, 15.0]
+    assert committed.past_key_values.layers[0].keys.untyped_storage().data_ptr() == storage_pointer
     assert torch.equal(committed.next_token_logits, tree_output.logits[:, 2])

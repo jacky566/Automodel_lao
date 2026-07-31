@@ -104,6 +104,14 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _acceptance_lengths(accepted_tokens: int | float, verify_steps: int | float) -> tuple[float | None, float | None]:
+    """Return official draft acceptance and actual emitted tokens per round."""
+    if verify_steps == 0:
+        return None, None
+    accept_length = accepted_tokens / verify_steps
+    return accept_length, 1.0 + accept_length
+
+
 def _greedy_cached_forward(
     target: nn.Module,
     model_inputs: dict[str, torch.Tensor],
@@ -359,12 +367,14 @@ def _dflash(
         target_verify_seconds += stats["target_verify_seconds"]
     _sync(device)
     wall = time.perf_counter() - start
+    accept_length, emitted_tokens_per_step = _acceptance_lengths(accepted_tokens, verify_steps)
     return {
         "completed": len(prompts),
         "output_tokens": output_tokens,
         "wall_clock_s": wall,
         "tok_s": output_tokens / wall,
-        "accept_length": 1.0 + accepted_tokens / verify_steps if verify_steps else None,
+        "accept_length": accept_length,
+        "emitted_tokens_per_step": emitted_tokens_per_step,
         "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
         "exact_match_count": exact_matches if reference_outputs is not None else None,
         "exact_match_rate": exact_matches / len(prompts) if reference_outputs is not None and prompts else None,
@@ -485,12 +495,14 @@ def _vispec(
                 common_prefix_tokens += 1
     _sync(device)
     wall = time.perf_counter() - start
+    accept_length, emitted_tokens_per_step = _acceptance_lengths(accepted_tokens, verify_steps)
     return {
         "completed": len(prompts),
         "output_tokens": output_tokens,
         "wall_clock_s": wall,
         "tok_s": output_tokens / wall,
-        "accept_length": 1.0 + accepted_tokens / verify_steps if verify_steps else None,
+        "accept_length": accept_length,
+        "emitted_tokens_per_step": emitted_tokens_per_step,
         "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
         "exact_match_count": exact_matches if reference_outputs is not None else None,
         "exact_match_rate": exact_matches / len(prompts) if reference_outputs is not None and prompts else None,

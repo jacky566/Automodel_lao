@@ -30,12 +30,120 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
 
 from nemo_automodel.components.speculative.eagle.target_v12 import (
     _shift_left_with_zero,
     _to_full_tensor,
 )
+
+
+class _VispecPreallocatedLayer(DynamicLayer):
+    """Dynamic-cache-compatible layer backed by reusable K/V storage."""
+
+    _MIN_FREE_TOKENS = 256
+
+    def __init__(self, keys: torch.Tensor, values: torch.Tensor) -> None:
+        """Copy one initialized dynamic layer into reusable storage.
+
+        Args:
+            keys: Key cache tensor of shape [batch, heads, sequence, head_dim].
+            values: Value cache tensor of shape [batch, heads, sequence, head_dim].
+        """
+        super().__init__()
+        if keys.shape != values.shape:
+            raise ValueError("ViSpec target key and value cache tensors must have matching shapes.")
+        if keys.ndim != 4:
+            raise ValueError("ViSpec target cache tensors must have shape [batch, heads, sequence, head_dim].")
+        self.dtype = keys.dtype
+        self.device = keys.device
+        self._length = keys.shape[-2]
+        capacity = self._length + self._MIN_FREE_TOKENS
+        storage_shape = (*keys.shape[:-2], capacity, keys.shape[-1])
+        self._key_storage = torch.empty(storage_shape, dtype=keys.dtype, device=keys.device)
+        self._value_storage = torch.empty(storage_shape, dtype=values.dtype, device=values.device)
+        self._key_storage[..., : self._length, :].copy_(keys)
+        self._value_storage[..., : self._length, :].copy_(values)
+        self.is_initialized = True
+
+    @property
+    def keys(self) -> torch.Tensor | None:
+        """Return a [batch, heads, sequence, head_dim] logical key-cache view."""
+        if not hasattr(self, "_key_storage") or self._key_storage is None:
+            return None
+        return self._key_storage[..., : self._length, :]
+
+    @keys.setter
+    def keys(self, value: torch.Tensor | None) -> None:
+        self._key_storage = value
+
+    @property
+    def values(self) -> torch.Tensor | None:
+        """Return a [batch, heads, sequence, head_dim] logical value-cache view."""
+        if not hasattr(self, "_value_storage") or self._value_storage is None:
+            return None
+        return self._value_storage[..., : self._length, :]
+
+    @values.setter
+    def values(self, value: torch.Tensor | None) -> None:
+        self._value_storage = value
+
+    def _ensure_capacity(self, required_length: int) -> None:
+        if required_length <= self._key_storage.shape[-2]:
+            return
+        capacity = max(required_length, self._key_storage.shape[-2] * 2)
+        storage_shape = (*self._key_storage.shape[:-2], capacity, self._key_storage.shape[-1])
+        keys = torch.empty(storage_shape, dtype=self.dtype, device=self.device)
+        values = torch.empty(storage_shape, dtype=self.dtype, device=self.device)
+        keys[..., : self._length, :].copy_(self._key_storage[..., : self._length, :])
+        values[..., : self._length, :].copy_(self._value_storage[..., : self._length, :])
+        self._key_storage = keys
+        self._value_storage = values
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append K/V tensors without reallocating while reserved storage fits.
+
+        Args:
+            key_states: Key tensor of shape [batch, heads, query, head_dim].
+            value_states: Value tensor of shape [batch, heads, query, head_dim].
+            *args: Unused Transformers cache arguments.
+            **kwargs: Unused Transformers cache keyword arguments.
+
+        Returns:
+            Logical key and value views of shape [batch, heads, sequence + query,
+            head_dim] that alias the layer-owned storage.
+        """
+        del args, kwargs
+        if key_states.shape != value_states.shape or key_states.shape[:-2] != self._key_storage.shape[:-2]:
+            raise ValueError("Appended ViSpec target key/value tensors must match the allocated cache layout.")
+        if key_states.shape[-1] != self._key_storage.shape[-1]:
+            raise ValueError("Appended ViSpec target key/value tensors must preserve head_dim.")
+        end = self._length + key_states.shape[-2]
+        self._ensure_capacity(end)
+        self._key_storage[..., self._length : end, :].copy_(key_states)
+        self._value_storage[..., self._length : end, :].copy_(value_states)
+        self._length = end
+        return self.keys, self.values
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        """Return the logical K/V length after appending ``query_length`` tokens."""
+        return self._length + query_length, 0
+
+    def get_seq_length(self) -> int:
+        """Return the logical cached sequence length."""
+        return self._length
+
+    def get_max_cache_shape(self) -> int:
+        """Return ``-1`` because storage grows geometrically when necessary."""
+        return -1
+
+    def crop(self, max_length: int) -> None:
+        """Reduce logical length while retaining allocated storage."""
+        if max_length < 0:
+            max_length = self._length - abs(max_length)
+        self._length = min(self._length, max_length)
 
 
 @dataclass
@@ -152,6 +260,26 @@ class HFVispecTargetModel:
         """Return the target model lm_head."""
         return self.model.lm_head
 
+    @staticmethod
+    def _preallocate_generation_cache(cache: Cache) -> Cache:
+        """Replace full-attention dynamic layers with reusable K/V storage.
+
+        Args:
+            cache: Target cache whose initialized K/V tensors have shape
+                [batch, heads, sequence, head_dim]. The returned cache is the
+                same container with its layer objects replaced in place.
+
+        Returns:
+            The input cache with reusable layer-owned K/V storage.
+        """
+        for layer_index, layer in enumerate(cache.layers):
+            if isinstance(layer, _VispecPreallocatedLayer) or not layer.is_initialized:
+                continue
+            if not isinstance(layer, DynamicLayer) or layer.is_sliding:
+                raise TypeError("ViSpec target cache preallocation supports full-attention dynamic layers only.")
+            cache.layers[layer_index] = _VispecPreallocatedLayer(layer.keys, layer.values)
+        return cache
+
     @torch.no_grad()
     def prefill_generation(self, model_inputs: dict[str, torch.Tensor]) -> VispecGenerationState:
         """Prefill the target cache and capture ViSpec prefix features.
@@ -195,6 +323,7 @@ class HFVispecTargetModel:
                 "ViSpec prefill cache must cover the prompt only: "
                 f"expected {input_ids.shape[1]} tokens, got {cache.get_seq_length()}."
             )
+        cache = self._preallocate_generation_cache(cache)
 
         return VispecGenerationState(
             input_ids=input_ids,
@@ -321,7 +450,10 @@ class HFVispecTargetModel:
         if accepted_tree_indices.ndim != 1 or accepted_tree_indices.numel() < 1:
             raise ValueError("ViSpec cache commit requires at least one accepted tree index.")
         tree_size = tree_output.token_ids.shape[1]
-        if int(accepted_tree_indices.min().item()) < 0 or int(accepted_tree_indices.max().item()) >= tree_size:
+        minimum_index, maximum_index = (
+            torch.stack((accepted_tree_indices.min(), accepted_tree_indices.max())).cpu().tolist()
+        )
+        if minimum_index < 0 or maximum_index >= tree_size:
             raise ValueError("Accepted ViSpec tree indices are outside the verified tree.")
         cache = state.past_key_values
         if not isinstance(cache, DynamicCache):

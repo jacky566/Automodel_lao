@@ -73,51 +73,40 @@ class VispecCachedGreedyDecoder:
         """
         if self.state is None:
             raise RuntimeError("Call prefill() before ViSpec decoding.")
-        best_accept_length = -1
-        best_leaf_index: int | None = None
-        best_path: tuple[int, ...] = ()
-        best_tree_indices: torch.Tensor | None = None
-        best_bonus_logits: torch.Tensor | None = None
         tree_token_ids = torch.tensor(
-            [[proposal.root_token_id, *(node.token_id for node in proposal.nodes)]],
+            [proposal.root_token_id, *(node.token_id for node in proposal.nodes)],
             dtype=self.state.input_ids.dtype,
             device=self.state.input_ids.device,
         )
-        for leaf_index, path, padded_tree_indices in zip(
-            proposal.leaf_indices,
-            proposal.candidate_paths(),
-            proposal.layout.retrieve_indices,
-        ):
-            tree_indices = padded_tree_indices[padded_tree_indices.ge(0)]
-            path_logits = torch.cat(
-                (
-                    self.state.next_token_logits.unsqueeze(1),
-                    tree_logits.index_select(1, tree_indices[:-1]),
-                ),
-                dim=1,
-            )
-            candidate_ids = tree_token_ids.index_select(1, tree_indices)
-            matches = candidate_ids.eq(path_logits.argmax(dim=-1))
-            accept_length = int(matches.cumprod(dim=1).sum().item())
-            if accept_length > best_accept_length:
-                best_accept_length = accept_length
-                best_leaf_index = leaf_index
-                best_path = path
-                best_tree_indices = tree_indices[:accept_length]
-                if accept_length > 0:
-                    best_bonus_logits = tree_logits[:, tree_indices[accept_length - 1]]
-                else:
-                    best_bonus_logits = self.state.next_token_logits
-
-        if best_tree_indices is None or best_bonus_logits is None or best_accept_length < 1:
+        padded_tree_indices = proposal.layout.retrieve_indices
+        valid_tree_indices = padded_tree_indices.ge(0)
+        safe_tree_indices = padded_tree_indices.clamp_min(0)
+        candidate_ids = tree_token_ids[safe_tree_indices]
+        greedy_ids = torch.empty_like(candidate_ids)
+        greedy_ids[:, 0] = self.state.next_token_logits.argmax(dim=-1)
+        if greedy_ids.shape[1] > 1:
+            tree_greedy_ids = tree_logits[0].argmax(dim=-1)
+            greedy_ids[:, 1:] = tree_greedy_ids[safe_tree_indices[:, :-1]]
+        matches = candidate_ids.eq(greedy_ids) & valid_tree_indices
+        accept_lengths = matches.long().cumprod(dim=1).sum(dim=1)
+        best_row = accept_lengths.argmax(dim=0)
+        best_accept_length_tensor = accept_lengths[best_row]
+        best_bonus_tree_index = safe_tree_indices[best_row, best_accept_length_tensor - 1]
+        best_bonus_token_id = tree_logits[0, best_bonus_tree_index].argmax(dim=-1)
+        best_row_index, best_accept_length, bonus_token_id = (
+            torch.stack((best_row, best_accept_length_tensor, best_bonus_token_id)).cpu().tolist()
+        )
+        if best_accept_length < 1:
             raise RuntimeError("The target-greedy ViSpec tree root must always be accepted.")
+        best_tree_indices = safe_tree_indices[best_row_index, :best_accept_length]
+        best_path = proposal.candidate_paths()[best_row_index]
 
         return (
             MSDVerificationResult(
                 accepted_token_ids=best_path[:best_accept_length],
-                bonus_token_id=int(best_bonus_logits.argmax(dim=-1).item()),
+                bonus_token_id=bonus_token_id,
                 accepted_draft_tokens=max(0, best_accept_length - 1),
-                leaf_index=best_leaf_index,
+                leaf_index=proposal.leaf_indices[best_row_index],
             ),
             best_tree_indices,
         )

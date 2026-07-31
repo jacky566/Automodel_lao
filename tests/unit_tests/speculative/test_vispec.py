@@ -99,6 +99,35 @@ class TestImageAdaptor:
 
 
 class TestDraftModel:
+    def test_cached_attention_matches_full_causal_attention(self):
+        """Chunked draft inference must preserve full-sequence FP32 attention."""
+        from nemo_automodel.components.speculative.eagle.draft_llama_v12 import _build_causal_mask
+
+        attention = _draft().layers[0].self_attn.eval()
+        torch.manual_seed(7)
+        hidden_states = torch.randn(1, 6, HIDDEN)
+        position_ids = torch.arange(6).unsqueeze(0)
+        full_mask = _build_causal_mask(torch.ones(1, 6), hidden_states.dtype)
+
+        with torch.no_grad():
+            full_output = attention(hidden_states, full_mask, position_ids)
+            _, prefix_cache = attention._forward_cached(
+                hidden_states[:, :4],
+                full_mask[:, :, :4, :4],
+                position_ids[:, :4],
+                None,
+            )
+            cached_output, cache = attention._forward_cached(
+                hidden_states[:, 4:],
+                full_mask[:, :, 4:, :],
+                position_ids[:, 4:],
+                prefix_cache,
+            )
+
+        torch.testing.assert_close(cached_output, full_output[:, 4:], rtol=1e-5, atol=1e-5)
+        assert cache[0].shape == (1, 4, 6, HIDDEN // 4)
+        assert cache[1].shape == (1, 4, 6, HIDDEN // 4)
+
     def test_output_keeps_original_sequence_layout(self):
         draft = _draft()
         out = draft(*_batch())

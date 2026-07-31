@@ -26,6 +26,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
@@ -184,12 +185,25 @@ class EagleLlamaAttention(nn.Module):
         repeated_k = self._repeat_kv(k)
         repeated_v = self._repeat_kv(v)
         if self.use_sdpa_attention:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q.contiguous(),
-                repeated_k.contiguous(),
-                repeated_v.contiguous(),
-                attn_mask=attention_mask.to(q.dtype),
-            )
+            if q.device.type == "cuda":
+                # cuDNN SDPA rebuilds execution plans as the cached prefix grows
+                # between ViSpec rounds. Efficient attention supports the same
+                # arbitrary additive tree mask without that dynamic-shape host
+                # overhead; math remains a compatibility fallback.
+                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q.contiguous(),
+                        repeated_k.contiguous(),
+                        repeated_v.contiguous(),
+                        attn_mask=attention_mask.to(q.dtype),
+                    )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q.contiguous(),
+                    repeated_k.contiguous(),
+                    repeated_v.contiguous(),
+                    attn_mask=attention_mask.to(q.dtype),
+                )
         else:
             attn_weights = torch.matmul(q, repeated_k.transpose(-2, -1)) * self.scaling
             attn_probs = torch.softmax((attn_weights + attention_mask).float(), dim=-1).to(repeated_v.dtype)
