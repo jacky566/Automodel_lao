@@ -37,6 +37,7 @@ Example::
         --dataset liuhaotian/LLaVA-Pretrain \\
         --image-root /data/LLaVA-Pretrain \\
         --output-dir /data/vispec_stage2 \\
+        --engine vllm --batch-size 8 \\
         --end 68000
 """
 
@@ -48,6 +49,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, Protocol
 
 import torch
 from datasets import load_dataset
@@ -60,6 +62,7 @@ from nemo_automodel.shared.import_utils import safe_import
 logger = logging.getLogger(__name__)
 
 HAVE_PIL, PIL_Image = safe_import("PIL.Image")
+HAVE_VLLM, VLLM = safe_import("vllm")
 
 LENGTH_INSTRUCTION = "Please answer with at least 1000 words."
 IMAGE_PLACEHOLDER = "<image>"
@@ -95,6 +98,13 @@ class RegenerationConfig:
             target saw here, so regenerating at a higher one supervises the
             draft against an image it never gets at training time.
         image_min_pixels: Per-image pixel floor, or ``None`` for the default.
+        engine: Inference engine used to regenerate answers.
+        batch_size: Number of requests submitted to vLLM at once. The Hugging
+            Face engine processes one request at a time.
+        tensor_parallel_size: Number of GPUs used by the vLLM model replica.
+        gpu_memory_utilization: Fraction of each GPU reserved by vLLM.
+        max_model_len: Maximum prompt plus generation length used by vLLM.
+        trust_remote_code: Whether model repositories may execute custom code.
     """
 
     model: str
@@ -110,6 +120,45 @@ class RegenerationConfig:
     length_instruction: str
     image_max_pixels: int | None = None
     image_min_pixels: int | None = None
+    engine: Literal["hf", "vllm"] = "hf"
+    batch_size: int = 8
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_model_len: int = 4096
+    trust_remote_code: bool = False
+
+    def build(self, *, processor: AutoProcessor) -> _AnswerGenerator:
+        """Build the configured answer generator around an initialized processor.
+
+        Args:
+            processor: Processor loaded from the same target checkpoint.
+
+        Returns:
+            The configured Hugging Face or vLLM answer generator.
+        """
+        if self.engine == "hf":
+            return _HfAnswerGenerator(_load_target_model(self.model), processor, self)
+        if self.engine == "vllm":
+            return _VllmAnswerGenerator(processor, self)
+        raise ValueError(f"Unsupported regeneration engine {self.engine!r}; expected 'hf' or 'vllm'.")
+
+
+@dataclass
+class _PreparedSample:
+    """One validated source row ready for target generation."""
+
+    prompt_text: str
+    image_path: str
+    absolute_image: str
+    content: list[dict]
+
+
+class _AnswerGenerator(Protocol):
+    """Backend contract for batched answer generation."""
+
+    def generate(self, samples: list[_PreparedSample]) -> list[str]:
+        """Generate one answer per sample, preserving input order."""
+        ...
 
 
 def _extract_prompt(example: dict) -> tuple[str, str] | None:
@@ -275,6 +324,87 @@ def _load_target_model(model_path: str) -> torch.nn.Module:
     return model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
 
+class _HfAnswerGenerator:
+    """Sequential Hugging Face generation backend."""
+
+    def __init__(self, model, processor, config: RegenerationConfig):
+        self._model = model
+        self._processor = processor
+        self._config = config
+
+    def generate(self, samples: list[_PreparedSample]) -> list[str]:
+        """Generate one answer per sample, preserving input order."""
+        return [
+            _generate_answer(
+                self._model,
+                self._processor,
+                [{"role": "user", "content": sample.content}],
+                self._config,
+            )
+            for sample in samples
+        ]
+
+
+class _VllmAnswerGenerator:
+    """Batched offline-vLLM generation backend for one-image requests."""
+
+    def __init__(self, processor, config: RegenerationConfig):
+        if not HAVE_VLLM:
+            raise ImportError(
+                "vLLM is required for --engine vllm. Install it with "
+                "`uv pip install vllm==0.23.0 --torch-backend=auto`."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("The vLLM regeneration engine requires an available GPU and NVIDIA driver.")
+        mm_processor_kwargs = {
+            key: value
+            for key, value in {
+                "max_pixels": config.image_max_pixels,
+                "min_pixels": config.image_min_pixels,
+            }.items()
+            if value is not None
+        }
+        engine_kwargs = {
+            "model": config.model,
+            "tensor_parallel_size": config.tensor_parallel_size,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
+            "max_model_len": config.max_model_len,
+            "max_num_seqs": config.batch_size,
+            "limit_mm_per_prompt": {"image": 1},
+            "trust_remote_code": config.trust_remote_code,
+            "seed": config.shuffle_seed,
+        }
+        if mm_processor_kwargs:
+            engine_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        self._llm = VLLM.LLM(**engine_kwargs)
+        self._sampling_params = VLLM.SamplingParams(
+            temperature=config.temperature,
+            max_tokens=config.max_new_tokens,
+        )
+        self._processor = processor
+
+    def generate(self, samples: list[_PreparedSample]) -> list[str]:
+        """Generate one answer per sample, preserving input order."""
+        requests = []
+        images = []
+        try:
+            for sample in samples:
+                messages = [{"role": "user", "content": sample.content}]
+                prompt = self._processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                image = PIL_Image.open(sample.absolute_image).convert("RGB")
+                images.append(image)
+                requests.append({"prompt": prompt, "multi_modal_data": {"image": image}})
+            outputs = self._llm.generate(requests, sampling_params=self._sampling_params, use_tqdm=False)
+            return [output.outputs[0].text.strip() for output in outputs]
+        finally:
+            for image in images:
+                image.close()
+
+
 def _load_source_dataset(dataset_path: str, split: str):
     """Load a source corpus from either a dataset ID or a local JSON file.
 
@@ -306,12 +436,12 @@ def regenerate(config: RegenerationConfig) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     data_path = output_dir / "data.jsonl"
 
-    processor = AutoProcessor.from_pretrained(config.model)
-    set_image_pixel_bounds(processor, max_pixels=config.image_max_pixels, min_pixels=config.image_min_pixels)
-    model = _load_target_model(config.model)
-
     dataset = _load_source_dataset(config.dataset, config.split).shuffle(seed=config.shuffle_seed)
     dataset = dataset.select(range(config.start, min(config.end, len(dataset))))
+
+    processor = AutoProcessor.from_pretrained(config.model)
+    set_image_pixel_bounds(processor, max_pixels=config.image_max_pixels, min_pixels=config.image_min_pixels)
+    generator = config.build(processor=processor)
 
     written = 0
     skipped = 0
@@ -321,6 +451,42 @@ def regenerate(config: RegenerationConfig) -> Path:
     # stalled or empty run distinguishable from a slow one while it is still
     # running rather than only from the final count.
     log_every = max(1, total // 100)
+
+    def write_batch(handle, samples: list[_PreparedSample]) -> tuple[int, int]:
+        """Generate and write a prepared batch, returning written and skipped counts."""
+        answers = generator.generate(samples)
+        if len(answers) != len(samples):
+            raise RuntimeError(
+                f"The {config.engine} engine returned {len(answers)} answers for {len(samples)} requests."
+            )
+        batch_written = 0
+        batch_skipped = 0
+        for sample, answer in zip(samples, answers, strict=True):
+            if not answer:
+                batch_skipped += 1
+                continue
+            # The stored prompt is the generation prompt, length instruction and
+            # part order included. Dropping the instruction would be closer to
+            # the deployment prompt shape, but it would also supervise the draft
+            # with an answer the target produced under a different prompt, and
+            # the reference stores the features of the exact modified prompt.
+            row = {
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": _serialize_human_turn(sample.prompt_text, config.length_instruction),
+                    },
+                    {"from": "gpt", "value": answer},
+                ],
+                "images": [sample.image_path],
+            }
+            _assert_prompt_round_trip(row, sample.content, config.image_root)
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            batch_written += 1
+        return batch_written, batch_skipped
+
+    pending: list[_PreparedSample] = []
+    effective_batch_size = config.batch_size if config.engine == "vllm" else 1
     with data_path.open("w") as handle:
         for index, example in enumerate(dataset):
             if index and index % log_every == 0:
@@ -336,25 +502,23 @@ def regenerate(config: RegenerationConfig) -> Path:
                 skipped += 1
                 continue
             content = _build_user_content(prompt_text, absolute_image, config.length_instruction)
-            answer = _generate_answer(model, processor, [{"role": "user", "content": content}], config)
-            if not answer:
-                skipped += 1
-                continue
-            # The stored prompt is the generation prompt, length instruction and
-            # part order included. Dropping the instruction would be closer to
-            # the deployment prompt shape, but it would also supervise the draft
-            # with an answer the target produced under a different prompt, and
-            # the reference stores the features of the exact modified prompt.
-            row = {
-                "conversations": [
-                    {"from": "human", "value": _serialize_human_turn(prompt_text, config.length_instruction)},
-                    {"from": "gpt", "value": answer},
-                ],
-                "images": [image_path],
-            }
-            _assert_prompt_round_trip(row, content, config.image_root)
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            written += 1
+            pending.append(
+                _PreparedSample(
+                    prompt_text=prompt_text,
+                    image_path=image_path,
+                    absolute_image=absolute_image,
+                    content=content,
+                )
+            )
+            if len(pending) == effective_batch_size:
+                batch_written, batch_skipped = write_batch(handle, pending)
+                written += batch_written
+                skipped += batch_skipped
+                pending.clear()
+        if pending:
+            batch_written, batch_skipped = write_batch(handle, pending)
+            written += batch_written
+            skipped += batch_skipped
 
     meta_path = _write_meta(output_dir, config.image_root)
     logger.info("Wrote %d regenerated samples (%d skipped) to %s; meta at %s", written, skipped, data_path, meta_path)
@@ -391,6 +555,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=LENGTH_INSTRUCTION,
         help="Sentence appended to every prompt to force a long answer; empty disables it.",
     )
+    parser.add_argument(
+        "--engine",
+        choices=("hf", "vllm"),
+        default="hf",
+        help="Generation engine. vLLM batches requests and requires a GPU.",
+    )
+    parser.add_argument("--batch-size", type=int, default=8, help="Requests submitted to vLLM per batch.")
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used by the vLLM model replica.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of each GPU reserved by vLLM.",
+    )
+    parser.add_argument("--max-model-len", type=int, default=4096, help="vLLM prompt plus generation limit.")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Allow model repository custom code.")
     return parser
 
 
@@ -400,6 +585,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.end <= args.start:
         raise ValueError(f"--end ({args.end}) must be greater than --start ({args.start})")
+    if args.batch_size <= 0:
+        raise ValueError(f"--batch-size must be positive, got {args.batch_size}")
+    if args.tensor_parallel_size <= 0:
+        raise ValueError(f"--tensor-parallel-size must be positive, got {args.tensor_parallel_size}")
+    if not 0 < args.gpu_memory_utilization <= 1:
+        raise ValueError(f"--gpu-memory-utilization must be in (0, 1], got {args.gpu_memory_utilization}")
+    if args.max_model_len <= 0:
+        raise ValueError(f"--max-model-len must be positive, got {args.max_model_len}")
     regenerate(
         RegenerationConfig(
             model=args.model,
@@ -415,6 +608,12 @@ def main(argv: list[str] | None = None) -> int:
             length_instruction=args.length_instruction,
             image_max_pixels=args.image_max_pixels,
             image_min_pixels=args.image_min_pixels,
+            engine=args.engine,
+            batch_size=args.batch_size,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            trust_remote_code=args.trust_remote_code,
         )
     )
     return 0

@@ -22,41 +22,208 @@ into one target forward, then compacts the accepted path in the target KV cache.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import inspect
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
+import yaml
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PretrainedConfig
 from transformers.cache_utils import DynamicCache
 
-DATASETS = (
-    ("gqa", 64),
-    ("textvqa", 64),
-    ("coco_caption", 128),
-    ("charxiv_reasoning", 256),
-    ("mmmu_pro", 256),
+FIXED_NEW_TOKENS = 512
+REPRESENTATIVE_BENCHMARKS = (
+    "scienceqa",
+    "mmvet",
+    "textvqa",
+    "coco_caption",
 )
+BENCHMARK_CONFIG = Path(__file__).parents[1] / "examples/speculative/bench_sweep/vlm_spec_bench_datasets.yaml"
 VISPEC_DEPTH = 3
 VISPEC_TOP_K = 8
 VISPEC_TOTAL_TOKEN = 30
+logger = logging.getLogger(__name__)
 
 
-def _load_prompt_module():
-    path = (
-        Path(__file__).parents[1]
-        / "artifacts/dflash/full/runs/qwen2_5_vl_5layer_6epoch_a256/epoch_3_step_10000/benchmark/run_first_rows.py"
+def _load_benchmark_specs(path: Path = BENCHMARK_CONFIG) -> list[dict[str, Any]]:
+    """Load and validate the representative four-dataset ViSpec suite."""
+    payload = yaml.safe_load(path.read_text())
+    specs = payload.get("datasets") if isinstance(payload, dict) else None
+    if not isinstance(specs, list):
+        raise ValueError(f"Benchmark config must contain a datasets list: {path}")
+    names = tuple(spec.get("name") for spec in specs if isinstance(spec, dict))
+    if names != REPRESENTATIVE_BENCHMARKS:
+        raise ValueError(f"Expected representative ViSpec benchmarks {REPRESENTATIVE_BENCHMARKS}, got {names}.")
+    invalid_lengths = [spec.get("name") for spec in specs if spec.get("max_new_tokens") != FIXED_NEW_TOKENS]
+    if invalid_lengths:
+        raise ValueError(f"Official benchmarks must all generate {FIXED_NEW_TOKENS} tokens: {invalid_lengths}")
+    return specs
+
+
+def _load_hf_rows(
+    input_data: str,
+    *,
+    split: str,
+    name: str | None,
+    shuffle_seed: int | None,
+):
+    """Stream rows from Hugging Face without downloading complete benchmark corpora."""
+    from datasets import load_dataset
+
+    rows = load_dataset(input_data, name=name, split=split, streaming=True)
+    if shuffle_seed is not None:
+        rows = rows.shuffle(seed=shuffle_seed, buffer_size=1_000)
+    return rows
+
+
+def _load_official_prompts(spec: dict[str, Any], num_prompts: int) -> list[list[dict[str, Any]]]:
+    """Load one official benchmark and adapt it to OpenAI Vision messages."""
+    from nemo_automodel.components.speculative.bench_multimodal import load_multimodal_prompts
+
+    prompt_args = argparse.Namespace(
+        benchmark_adapter=spec["benchmark_adapter"],
+        input_data=spec["input_data"],
+        split=spec.get("split", "test"),
+        dataset_name=spec.get("dataset_name"),
+        shuffle_seed=None,
+        num_prompts=num_prompts,
     )
-    spec = importlib.util.spec_from_file_location("first_rows", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load benchmark prompt adapter at {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    prompts = load_multimodal_prompts(prompt_args, _load_hf_rows)
+    if len(prompts) != num_prompts:
+        raise ValueError(
+            f"Benchmark {spec['name']} provided {len(prompts)} valid prompts; {num_prompts} were requested."
+        )
+    return prompts
+
+
+def _report_sample_progress(
+    *,
+    mode: str,
+    benchmark_name: str,
+    sample_index: int,
+    total_samples: int,
+    output_tokens: int,
+    start_time: float,
+) -> None:
+    """Log sample-level progress and rolling output throughput."""
+    elapsed = max(time.perf_counter() - start_time, 1e-9)
+    logger.info(
+        "[%s] benchmark=%s sample=%d/%d completed elapsed=%.1fs rolling_tok_s=%.2f",
+        mode,
+        benchmark_name,
+        sample_index,
+        total_samples,
+        elapsed,
+        output_tokens / elapsed,
+    )
+
+
+def _load_baseline_throughput(
+    path: Path,
+    benchmark_limits: dict[str, int],
+    *,
+    num_prompts: int,
+    fixed_output_length: bool,
+) -> dict[str, float]:
+    """Load compatible per-benchmark throughput from a completed baseline run."""
+    payload = json.loads(path.read_text())
+    throughputs: dict[str, float] = {}
+    for benchmark_name, max_new_tokens in benchmark_limits.items():
+        result = payload.get(benchmark_name) if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise ValueError(f"Baseline results do not contain benchmark {benchmark_name!r}: {path}")
+        if result.get("mode") != "baseline":
+            raise ValueError(f"Baseline result for {benchmark_name!r} has mode={result.get('mode')!r}.")
+        if result.get("num_prompts") != num_prompts:
+            raise ValueError(
+                f"Baseline result for {benchmark_name!r} used {result.get('num_prompts')} prompts; "
+                f"the current run uses {num_prompts}."
+            )
+        if result.get("max_new_tokens") != max_new_tokens:
+            raise ValueError(
+                f"Baseline result for {benchmark_name!r} used max_new_tokens={result.get('max_new_tokens')}; "
+                f"the current run uses {max_new_tokens}."
+            )
+        if bool(result.get("fixed_output_length")) != fixed_output_length:
+            raise ValueError(f"Baseline result for {benchmark_name!r} used a different fixed-output-length mode.")
+        throughput = result.get("tok_s")
+        if not isinstance(throughput, (int, float)) or throughput <= 0:
+            raise ValueError(f"Baseline result for {benchmark_name!r} has invalid tok_s={throughput!r}.")
+        throughputs[benchmark_name] = float(throughput)
+    return throughputs
+
+
+def _load_sharegpt_vlm_prompts(
+    input_data: Path,
+    media_dir: Path,
+    *,
+    start: int,
+    limit: int,
+) -> list[list[dict[str, Any]]]:
+    """Load deterministic multimodal prompts from a ShareGPT-style JSONL.
+
+    Args:
+        input_data: JSONL whose rows contain ``conversations`` and ``images``.
+        media_dir: Directory used to resolve relative image paths.
+        start: Zero-based source row at which to begin.
+        limit: Exact number of prompts to load.
+
+    Returns:
+        OpenAI Vision-style user messages with image placeholders expanded in
+        their original text order.
+    """
+    if start < 0:
+        raise ValueError(f"start must be non-negative, got {start}.")
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}.")
+
+    prompts: list[list[dict[str, Any]]] = []
+    with input_data.open() as handle:
+        for row_index, line in enumerate(handle):
+            if row_index < start:
+                continue
+            if len(prompts) == limit:
+                break
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON at {input_data}:{row_index + 1}.") from error
+            conversations = row.get("conversations")
+            images = row.get("images")
+            if not isinstance(conversations, list) or not isinstance(images, list):
+                raise ValueError(f"Row {row_index} must contain list-valued conversations and images.")
+            user_turn = next(
+                (turn for turn in conversations if isinstance(turn, dict) and turn.get("from") in {"human", "user"}),
+                None,
+            )
+            if user_turn is None or not isinstance(user_turn.get("value"), str):
+                raise ValueError(f"Row {row_index} has no string-valued human conversation turn.")
+            text_parts = user_turn["value"].split("<image>")
+            if len(text_parts) - 1 != len(images):
+                raise ValueError(
+                    f"Row {row_index} has {len(text_parts) - 1} image placeholders but {len(images)} image paths."
+                )
+            content: list[dict[str, Any]] = []
+            for image_index, text_part in enumerate(text_parts):
+                if text_part.strip():
+                    content.append({"type": "text", "text": text_part.strip()})
+                if image_index < len(images):
+                    image_path = Path(images[image_index])
+                    absolute_image = image_path if image_path.is_absolute() else media_dir / image_path
+                    if not absolute_image.is_file():
+                        raise FileNotFoundError(f"Image for row {row_index} does not exist: {absolute_image}")
+                    content.append({"type": "image_url", "image_url": {"url": str(absolute_image)}})
+            prompts.append([{"role": "user", "content": content}])
+
+    if len(prompts) != limit:
+        raise ValueError(
+            f"Requested {limit} prompts starting at row {start}, but {input_data} provided {len(prompts)}."
+        )
+    return prompts
 
 
 def _to_hf_messages(prompt: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -105,7 +272,7 @@ def _sync(device: torch.device) -> None:
 
 
 def _acceptance_lengths(accepted_tokens: int | float, verify_steps: int | float) -> tuple[float | None, float | None]:
-    """Return official draft acceptance and actual emitted tokens per round."""
+    """Return accepted draft tokens and actual emitted tokens per round."""
     if verify_steps == 0:
         return None, None
     accept_length = accepted_tokens / verify_steps
@@ -205,8 +372,14 @@ def _greedy_cached_forward(
             "second_per_grid_ts": None,
             "mm_token_type_ids": None,
         }
-        step_kwargs["position_ids"] = position_hook(
+        multimodal_position_ids = position_hook(
             **{key: value for key, value in position_kwargs.items() if key in position_hook_params}
+        )
+        text_position_ids = full_attention_mask.long().cumsum(dim=-1) - 1
+        text_position_ids.masked_fill_(full_attention_mask == 0, 0)
+        step_kwargs["position_ids"] = torch.cat(
+            (text_position_ids.unsqueeze(0), multimodal_position_ids),
+            dim=0,
         )[..., -1:]
         if "cache_position" in target_forward_params:
             step_kwargs["cache_position"] = torch.tensor([active_length - 1], dtype=torch.long, device=input_ids.device)
@@ -229,11 +402,13 @@ def _baseline(
     max_new_tokens: int,
     device: torch.device,
     fixed_output_length: bool = False,
+    *,
+    benchmark_name: str = "benchmark",
 ) -> dict[str, Any]:
     """Run one-token cached target forwards and report output-token throughput."""
     output_tokens = 0
     reference_outputs: list[list[int]] = []
-    eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
+    eos_token_id = None if fixed_output_length else getattr(processor.tokenizer, "eos_token_id", None)
     if prompts:
         warmup_inputs = _prepare_inputs(processor, prompts[0], device)
         _greedy_cached_forward(
@@ -245,6 +420,12 @@ def _baseline(
     _sync(device)
     start = time.perf_counter()
     for prompt_index, prompt in enumerate(prompts):
+        logger.info(
+            "[baseline] benchmark=%s sample=%d/%d started",
+            benchmark_name,
+            prompt_index + 1,
+            len(prompts),
+        )
         inputs = _prepare_inputs(processor, prompt, device)
         generated = _greedy_cached_forward(
             target,
@@ -252,8 +433,18 @@ def _baseline(
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
         )
+        if fixed_output_length and len(generated) != max_new_tokens:
+            raise RuntimeError(f"Baseline generated {len(generated)} tokens; expected exactly {max_new_tokens}.")
         output_tokens += len(generated)
         reference_outputs.append(generated)
+        _report_sample_progress(
+            mode="baseline",
+            benchmark_name=benchmark_name,
+            sample_index=prompt_index + 1,
+            total_samples=len(prompts),
+            output_tokens=output_tokens,
+            start_time=start,
+        )
     _sync(device)
     wall = time.perf_counter() - start
     return {
@@ -294,6 +485,8 @@ def _dflash(
     reference_outputs=None,
     fixed_output_length: bool = False,
     verification_mode: str = "block",
+    *,
+    benchmark_name: str = "benchmark",
 ) -> dict[str, Any]:
     """Run DFlash's block verifier with prompt-only multimodal target inputs."""
     output_tokens = 0
@@ -322,6 +515,12 @@ def _dflash(
     _sync(device)
     start = time.perf_counter()
     for prompt_index, prompt in enumerate(prompts):
+        logger.info(
+            "[dflash] benchmark=%s sample=%d/%d started",
+            benchmark_name,
+            prompt_index + 1,
+            len(prompts),
+        )
         inputs = _prepare_inputs(processor, prompt, device)
         prompt_ids = inputs.pop("input_ids")
         sample_max_new_tokens = (
@@ -345,7 +544,10 @@ def _dflash(
             return_stats=True,
             sequential_target_verification=verification_mode == "sequential",
         )
-        output_tokens += int(output.shape[1] - prompt_ids.shape[1])
+        generated_length = int(output.shape[1] - prompt_ids.shape[1])
+        if fixed_output_length and generated_length != sample_max_new_tokens:
+            raise RuntimeError(f"DFlash generated {generated_length} tokens; expected exactly {sample_max_new_tokens}.")
+        output_tokens += generated_length
         if reference_outputs is not None:
             generated_ids = output[0, prompt_ids.shape[1] :].tolist()
             reference_ids = reference_outputs[prompt_index]
@@ -365,6 +567,14 @@ def _dflash(
         target_prefill_seconds += stats["target_prefill_seconds"]
         draft_seconds += stats["draft_seconds"]
         target_verify_seconds += stats["target_verify_seconds"]
+        _report_sample_progress(
+            mode="dflash",
+            benchmark_name=benchmark_name,
+            sample_index=prompt_index + 1,
+            total_samples=len(prompts),
+            output_tokens=output_tokens,
+            start_time=start,
+        )
     _sync(device)
     wall = time.perf_counter() - start
     accept_length, emitted_tokens_per_step = _acceptance_lengths(accepted_tokens, verify_steps)
@@ -424,6 +634,8 @@ def _vispec(
     device: torch.device,
     reference_outputs=None,
     fixed_output_length: bool = False,
+    *,
+    benchmark_name: str = "benchmark",
 ) -> dict[str, Any]:
     """Run batch-one ViSpec/MSD rounds with cached target verification."""
     from nemo_automodel.components.speculative.eagle.vispec_decode import VispecCachedGreedyDecoder
@@ -452,6 +664,12 @@ def _vispec(
     _sync(device)
     start = time.perf_counter()
     for prompt_index, prompt in enumerate(prompts):
+        logger.info(
+            "[vispec] benchmark=%s sample=%d/%d started",
+            benchmark_name,
+            prompt_index + 1,
+            len(prompts),
+        )
         model_inputs = _prepare_inputs(processor, prompt, device)
         decoder.prefill(model_inputs)
         sample_max_new_tokens = (
@@ -472,6 +690,8 @@ def _vispec(
             if not fixed_output_length and eos_token_id in emitted:
                 emitted = emitted[: emitted.index(eos_token_id) + 1]
             if not emitted:
+                if fixed_output_length:
+                    raise RuntimeError("ViSpec emitted no token before reaching the fixed output length.")
                 break
             generated_ids.extend(emitted)
             generated += len(emitted)
@@ -481,6 +701,14 @@ def _vispec(
             verify_steps += 1
             if not fixed_output_length and eos_token_id in emitted:
                 break
+        _report_sample_progress(
+            mode="vispec",
+            benchmark_name=benchmark_name,
+            sample_index=prompt_index + 1,
+            total_samples=len(prompts),
+            output_tokens=output_tokens,
+            start_time=start,
+        )
         if reference_outputs is not None:
             reference_ids = reference_outputs[prompt_index]
             exact_matches += int(generated_ids == reference_ids)
@@ -517,44 +745,103 @@ def _vispec(
 
 def main() -> None:
     """Run the requested batch-one speculative decoding benchmark."""
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logger.setLevel(logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True)
     parser.add_argument("--draft", required=True)
     parser.add_argument("--mode", choices=("baseline", "dflash", "vispec"), required=True)
-    parser.add_argument("--num-prompts", type=int, default=64)
-    parser.add_argument("--fixed-output-length", action="store_true")
+    parser.add_argument("--num-prompts", type=int, default=100)
+    parser.add_argument(
+        "--fixed-output-length",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate exactly max-new-tokens per sample (default: enabled).",
+    )
     parser.add_argument("--block-size", type=int, choices=(4, 8, 16))
     parser.add_argument("--draft-layers", type=int, choices=(1, 3, 5))
     parser.add_argument("--attn-implementation", choices=("eager", "sdpa"), default="eager")
     parser.add_argument("--verification-mode", choices=("block", "sequential"), default="block")
-    parser.add_argument("--only", choices=[name for name, _ in DATASETS])
+    parser.add_argument("--only", choices=REPRESENTATIVE_BENCHMARKS)
+    parser.add_argument(
+        "--baseline-results",
+        type=Path,
+        help="Completed baseline JSON used to calculate speedup without rerunning autoregressive decoding.",
+    )
+    parser.add_argument("--input-data", type=Path, help="Local ShareGPT-style multimodal JSONL.")
+    parser.add_argument("--media-dir", type=Path, help="Root for relative image paths in --input-data.")
+    parser.add_argument("--input-start", type=int, default=0, help="First JSONL row used by the local benchmark.")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=FIXED_NEW_TOKENS,
+        help="Generation length for --input-data (official benchmarks always use 512).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    prompt_module = _load_prompt_module()
+    if args.input_data is not None and args.media_dir is None:
+        parser.error("--media-dir is required with --input-data")
+    if args.input_data is None and args.media_dir is not None:
+        parser.error("--media-dir requires --input-data")
+    if args.input_data is not None and args.only is not None:
+        parser.error("--only cannot be combined with --input-data")
+    if args.max_new_tokens <= 0:
+        parser.error("--max-new-tokens must be positive")
+    if args.num_prompts <= 0:
+        parser.error("--num-prompts must be positive")
+    if args.mode == "baseline" and args.baseline_results is not None:
+        parser.error("--baseline-results is only valid for dflash and vispec modes")
+
+    if args.input_data is not None:
+        benchmark_inputs = [
+            (
+                "local_jsonl",
+                args.max_new_tokens,
+                _load_sharegpt_vlm_prompts(
+                    args.input_data,
+                    args.media_dir,
+                    start=args.input_start,
+                    limit=args.num_prompts,
+                ),
+            )
+        ]
+    else:
+        benchmark_inputs = []
+        for spec in _load_benchmark_specs():
+            if args.only is not None and spec["name"] != args.only:
+                continue
+            logger.info("[setup] loading benchmark=%s prompts=%d", spec["name"], args.num_prompts)
+            prompts = _load_official_prompts(spec, args.num_prompts)
+            benchmark_inputs.append((spec["name"], FIXED_NEW_TOKENS, prompts))
+
+    benchmark_limits = {name: max_new_tokens for name, max_new_tokens, _ in benchmark_inputs}
+    baseline_throughputs = (
+        _load_baseline_throughput(
+            args.baseline_results,
+            benchmark_limits,
+            num_prompts=args.num_prompts,
+            fixed_output_length=args.fixed_output_length,
+        )
+        if args.baseline_results is not None
+        else {}
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("[setup] loading target=%s", args.target)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     target = _load_target(args.target, device, args.attn_implementation)
     processor = AutoProcessor.from_pretrained(args.target)
     results: dict[str, Any] = {}
-    for name, max_new_tokens in DATASETS:
-        if args.only is not None and name != args.only:
-            continue
-        prompts = prompt_module._load_prompts(
-            name, *prompt_module.DATASETS[[item[0] for item in prompt_module.DATASETS].index(name)][1:4]
+    for benchmark_index, (name, max_new_tokens, prompts) in enumerate(benchmark_inputs, start=1):
+        logger.info(
+            "[%s] starting benchmark=%s (%d/%d) samples=%d tokens_per_sample=%d",
+            args.mode,
+            name,
+            benchmark_index,
+            len(benchmark_inputs),
+            len(prompts),
+            max_new_tokens,
         )
-        prompts = prompts[: args.num_prompts]
-        reference_outputs = None
-        baseline_result = None
-        if args.mode != "baseline":
-            baseline_result = _baseline(
-                target,
-                processor,
-                prompts,
-                max_new_tokens,
-                device,
-                fixed_output_length=args.fixed_output_length,
-            )
-            reference_outputs = baseline_result.pop("_reference_outputs")
         if args.mode == "baseline":
             result = _baseline(
                 target,
@@ -563,6 +850,7 @@ def main() -> None:
                 max_new_tokens,
                 device,
                 fixed_output_length=args.fixed_output_length,
+                benchmark_name=name,
             )
         elif args.mode == "dflash":
             draft = _load_dflash(args.draft, target, device)
@@ -577,9 +865,10 @@ def main() -> None:
                 prompts,
                 max_new_tokens,
                 device,
-                reference_outputs,
+                None,
                 fixed_output_length=args.fixed_output_length,
                 verification_mode=args.verification_mode,
+                benchmark_name=name,
             )
         else:
             result = _vispec(
@@ -589,18 +878,26 @@ def main() -> None:
                 prompts,
                 max_new_tokens,
                 device,
-                reference_outputs,
+                None,
                 fixed_output_length=args.fixed_output_length,
+                benchmark_name=name,
             )
         if args.mode == "baseline":
             result.pop("_reference_outputs", None)
-        elif baseline_result is not None:
-            result["speedup_vs_target"] = (
-                result["tok_s"] / baseline_result["tok_s"] if baseline_result["tok_s"] else None
-            )
+        if name in baseline_throughputs:
+            result["baseline_tok_s"] = baseline_throughputs[name]
+            result["speedup_vs_cached_autoregressive"] = result["tok_s"] / baseline_throughputs[name]
         results[name] = {
+            "target": args.target,
+            "draft": args.draft,
+            "mode": args.mode,
+            "num_prompts": len(prompts),
             "max_new_tokens": max_new_tokens,
             "fixed_output_length": args.fixed_output_length,
+            "input_data": str(args.input_data) if args.input_data is not None else None,
+            "media_dir": str(args.media_dir) if args.media_dir is not None else None,
+            "input_start": args.input_start if args.input_data is not None else None,
+            "baseline_results": str(args.baseline_results) if args.baseline_results is not None else None,
             "block_size": args.block_size if args.mode == "dflash" else None,
             "draft_layers": args.draft_layers if args.mode == "dflash" else None,
             "attn_implementation": args.attn_implementation,
@@ -612,7 +909,16 @@ def main() -> None:
             "vispec_total_token": VISPEC_TOTAL_TOKEN if args.mode == "vispec" else None,
             **result,
         }
-        print(json.dumps({name: results[name]}, indent=2), flush=True)
+        args.output.write_text(json.dumps(results, indent=2) + "\n")
+        logger.info(
+            "[%s] completed benchmark=%s (%d/%d) tok_s=%.2f; partial results saved to %s",
+            args.mode,
+            name,
+            benchmark_index,
+            len(benchmark_inputs),
+            results[name]["tok_s"],
+            args.output,
+        )
     args.output.write_text(json.dumps(results, indent=2) + "\n")
 
 

@@ -21,10 +21,12 @@ swap, the lambda_base injection, and the extra-metrics logging.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
@@ -36,6 +38,58 @@ HIDDEN = 32
 BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 TARGET_LAYER_IDS = [1, 3, 5]
+
+
+def test_qwen2_5_vl_domino_example_matches_dflash_training_parameters():
+    """The Qwen2.5-VL Domino run changes only algorithm-specific settings and output ownership."""
+    examples_dir = Path(__file__).parents[4] / "examples/speculative/dflash"
+    dflash = yaml.safe_load((examples_dir / "qwen2_5_vl_dflash.yaml").read_text())
+    domino = yaml.safe_load((examples_dir / "qwen2_5_vl_domino.yaml").read_text())
+
+    shared_recipe_args = {
+        "target_model_name_or_path",
+        "seq_length",
+        "image_min_pixels",
+        "image_max_pixels",
+        "micro_batch_size",
+        "grad_accumulation_steps",
+        "num_workers",
+        "num_epochs",
+        "draft_num_hidden_layers",
+        "block_size",
+        "num_anchors",
+        "loss_decay_gamma",
+        "mask_token_id",
+        "attention_backend",
+        "trust_remote_code",
+        "target_attn_implementation",
+        "shuffle_seed",
+        "log_every_steps",
+        "max_grad_norm",
+        "ckpt_every_steps",
+    }
+    assert domino["recipe"] == "TrainDominoRecipe"
+    assert {key: domino["recipe_args"][key] for key in shared_recipe_args} == {
+        key: dflash["recipe_args"][key] for key in shared_recipe_args
+    }
+    assert domino["dist_env"] == dflash["dist_env"]
+    assert domino["dataset"] == dflash["dataset"]
+    assert domino["optimizer"] == dflash["optimizer"]
+    assert domino["compile"] == dflash["compile"]
+    assert {
+        key: domino["checkpoint"][key]
+        for key in ("enabled", "model_save_format", "save_consolidated", "max_recent_checkpoints")
+    } == {
+        key: dflash["checkpoint"][key]
+        for key in ("enabled", "model_save_format", "save_consolidated", "max_recent_checkpoints")
+    }
+    assert domino["checkpoint"]["checkpoint_dir"] != dflash["checkpoint"]["checkpoint_dir"]
+    assert domino["recipe_args"]["emb_dim"] == 256
+    assert domino["recipe_args"]["gru_hidden_dim"] == 1024
+    assert domino["recipe_args"]["pure_draft_prefix_len"] == 1
+    assert domino["recipe_args"]["shift_label"] is True
+    assert domino["recipe_args"]["lambda_base_start"] == 1.0
+    assert domino["recipe_args"]["lambda_base_decay_ratio"] == 1.0
 
 
 def _domino_draft(shift_label=True, pure_prefix=1):

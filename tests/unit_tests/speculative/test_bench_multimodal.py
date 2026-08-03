@@ -26,43 +26,69 @@ from nemo_automodel.components.speculative.bench_multimodal import (
 
 
 @pytest.mark.parametrize(
-    ("benchmark", "question_column"),
+    "benchmark",
     [
-        (MultimodalBenchmark.GQA, "question"),
-        (MultimodalBenchmark.TEXTVQA, "question"),
-        (MultimodalBenchmark.COCO_CAPTION, "question"),
-        (MultimodalBenchmark.CHARXIV_REASONING, "reasoning_q"),
+        MultimodalBenchmark.MMVET,
+        MultimodalBenchmark.MME,
+        MultimodalBenchmark.VIZWIZ,
     ],
 )
-def test_single_image_adapters_build_openai_vision_messages(benchmark, question_column):
-    row = {question_column: "What is shown?", "image": b"jpeg"}
+def test_explanation_adapters_build_user_only_messages(benchmark):
+    row = {"question": "What is shown?", "image": b"jpeg"}
     prompt = adapt_multimodal_row(row, benchmark)
     assert prompt is not None
+    assert len(prompt) == 1
     assert prompt[0]["role"] == "user"
-    assert prompt[0]["content"][0]["type"] == "image_url"
-    assert prompt[0]["content"][0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert prompt[0]["content"][1] == {"type": "text", "text": "What is shown?"}
+    assert prompt[0]["content"][0] == {"type": "text", "text": "What is shown?"}
+    assert prompt[0]["content"][1] == {"type": "text", "text": "Please answer with an explanation."}
+    assert prompt[0]["content"][2]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
-def test_mmmu_pro_interleaves_numbered_images_and_formats_options():
+def test_scienceqa_formats_context_and_choices():
     row = {
-        "question": "Compare <image 1> with <image 2>.",
-        "options": "['first', 'second', 'third', 'fourth']",
-        "image_1": b"one",
-        "image_2": b"two",
-        **{f"image_{index}": None for index in range(3, 8)},
+        "question": "Which animal is shown?",
+        "choices": ["cat", "dog"],
+        "hint": "It barks.",
+        "image": b"jpeg",
     }
-    prompt = adapt_multimodal_row(row, MultimodalBenchmark.MMMU_PRO)
+    prompt = adapt_multimodal_row(row, MultimodalBenchmark.SCIENCEQA)
     assert prompt is not None
-    parts = prompt[0]["content"]
-    assert [part["type"] for part in parts[:4]] == ["text", "image_url", "text", "image_url"]
-    assert "A. first" in parts[-1]["text"]
-    assert "Answer with the option letter only." in parts[-1]["text"]
+    text = prompt[0]["content"][0]["text"]
+    assert "Context: It barks." in text
+    assert "Options: (A) cat (B) dog" in text
+    assert 'begin with "The answer is"' in text
 
 
-def test_mmmu_pro_rejects_invalid_options():
-    row = {"question": "q", "options": "not a list", "image_1": b"image"}
-    assert adapt_multimodal_row(row, MultimodalBenchmark.MMMU_PRO) is None
+def test_textvqa_uses_official_ocr_instruction():
+    prompt = adapt_multimodal_row(
+        {"question": "Read the sign.", "image": b"jpeg"},
+        MultimodalBenchmark.TEXTVQA,
+    )
+    assert prompt is not None
+    assert "Perform an OCR task" in prompt[0]["content"][1]["text"]
+
+
+def test_coco_caption_uses_official_description_prompt():
+    prompt = adapt_multimodal_row({"image": b"jpeg"}, MultimodalBenchmark.COCO_CAPTION)
+    assert prompt is not None
+    assert prompt[0]["content"][0]["text"] == "Please provide a detailed description of the given image."
+
+
+def test_seed_bench_formats_image_multiple_choice_rows_only():
+    row = {
+        "question": "What color is the car?",
+        "choice_a": "red",
+        "choice_b": "blue",
+        "choice_c": "green",
+        "choice_d": "black",
+        "data_type": "image",
+        "image": [b"jpeg"],
+    }
+    prompt = adapt_multimodal_row(row, MultimodalBenchmark.SEED_BENCH)
+    assert prompt is not None
+    assert "(A) red (B) blue (C) green (D) black" in prompt[0]["content"][0]["text"]
+    row["data_type"] = "video"
+    assert adapt_multimodal_row(row, MultimodalBenchmark.SEED_BENCH) is None
 
 
 def test_gqa_loader_joins_instruction_and_image_configs():
@@ -88,6 +114,24 @@ def test_gqa_loader_joins_instruction_and_image_configs():
         ("lmms-lab/GQA", "testdev", "testdev_balanced_instructions", 7),
         ("lmms-lab/GQA", "testdev", "testdev_balanced_images", None),
     ]
+    assert prompts[0][0]["content"][0]["text"] == "Is it overcast?"
+
+
+def test_coco_loader_deduplicates_captions_for_the_same_image():
+    args = SimpleNamespace(
+        benchmark_adapter="coco_caption",
+        input_data="lmms-lab/COCO-Caption2017",
+        split="val",
+        dataset_name=None,
+        shuffle_seed=None,
+        num_prompts=2,
+    )
+    rows = [
+        {"id": 1, "image": b"first"},
+        {"id": 1, "image": b"first"},
+        {"id": 2, "image": b"second"},
+    ]
+    assert len(load_multimodal_prompts(args, lambda *args, **kwargs: rows)) == 2
 
 
 def test_gqa_loader_requires_instruction_config():

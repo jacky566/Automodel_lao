@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn as nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.core import compute_accept_len
@@ -36,6 +37,19 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 EMB_DIM = 16
 GRU_HIDDEN = 24
+
+
+class _TinyDominoTarget(nn.Module):
+    """Target-side embedding and LM head needed by draft token sampling."""
+
+    def __init__(self, embed_tokens: nn.Module, lm_head: nn.Module) -> None:
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.lm_head = lm_head
+
+    def get_input_embeddings(self) -> nn.Module:
+        """Return the target token embedding module."""
+        return self.embed_tokens
 
 
 def _draft_config(projector_type="domino", pure_prefix=1, shift_label=True):
@@ -121,6 +135,64 @@ def test_draft_without_projector_has_no_head():
 def test_draft_unknown_projector_raises():
     with pytest.raises(ValueError, match="Unknown draft projector_type"):
         Qwen3DFlashDraftModel(_draft_config(projector_type="mystery"))
+
+
+@pytest.mark.parametrize("shift_label", [False, True])
+def test_domino_incremental_sampling_matches_training_head(shift_label: bool) -> None:
+    """Autoregressive inference must use the same position mapping as the training head."""
+    torch.manual_seed(23)
+    trainer = _build_trainer(pure_prefix=1, shift_label=shift_label)
+    draft = trainer.draft_model.eval()
+    target = _TinyDominoTarget(trainer.embed_tokens, trainer.lm_head).eval()
+    draft_hidden = torch.randn(1, BLOCK_SIZE, HIDDEN)
+    block_ids = torch.tensor([[7, MASK_ID, MASK_ID, MASK_ID]])
+
+    completed_ids = block_ids.clone()
+    base_logits4d = target.lm_head(draft_hidden).unsqueeze(1)
+    hidden4d = draft_hidden.unsqueeze(1)
+    with torch.inference_mode():
+        for token_position in range(1, BLOCK_SIZE):
+            final_logits = trainer._apply_domino_head(
+                base_logits4d=base_logits4d,
+                hidden4d=hidden4d,
+                prev_ids=completed_ids.unsqueeze(1),
+                target_ids=completed_ids.unsqueeze(1),
+            )
+            head_position = token_position - 1 if shift_label else token_position
+            completed_ids[:, token_position] = final_logits[:, 0, head_position, :].argmax(dim=-1)
+
+        sampled_ids = draft._sample_draft_tokens(target, draft_hidden, block_ids)
+
+    torch.testing.assert_close(sampled_ids, completed_ids[:, 1:])
+
+
+def test_domino_sampling_uses_pure_prefix_then_causal_correction() -> None:
+    """The configured pure prefix stays uncorrected while later tokens consume prior samples."""
+    trainer = _build_trainer(pure_prefix=1, shift_label=True)
+    draft = trainer.draft_model.eval()
+    target = _TinyDominoTarget(trainer.embed_tokens, trainer.lm_head).eval()
+
+    with torch.no_grad():
+        for parameter in draft.parameters():
+            parameter.zero_()
+        for parameter in target.parameters():
+            parameter.zero_()
+        target.embed_tokens.weight[1, 0] = 1.0
+        target.embed_tokens.weight[3, 0] = 1.0
+        draft.prefix_gru.weight_ih_l0[2 * GRU_HIDDEN, 0] = 2.0
+        draft.embed_proj[0].weight[0, HIDDEN] = 4.0
+        draft.embed_proj[2].weight[3, 0] = 4.0
+
+    draft_hidden = torch.zeros(1, BLOCK_SIZE, HIDDEN)
+    block_ids = torch.tensor([[1, MASK_ID, MASK_ID, MASK_ID]])
+    corrected = draft._sample_draft_tokens(target, draft_hidden, block_ids)
+
+    torch.testing.assert_close(corrected, torch.tensor([[0, 3, 3]]))
+
+    with torch.no_grad():
+        draft.embed_proj[2].weight.zero_()
+    uncorrected = draft._sample_draft_tokens(target, draft_hidden, block_ids)
+    torch.testing.assert_close(uncorrected, torch.tensor([[0, 0, 0]]))
 
 
 def test_trainer_requires_domino_draft():

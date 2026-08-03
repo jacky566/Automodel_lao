@@ -51,6 +51,10 @@ EXCLUDED_RECIPE_FILES = {
     # A plain YAML list of bench_sweep.py dataset entries, not a recipe config
     # (consumed via --datasets-config, launched with python -m ... bench_sweep).
     Path("examples/speculative/bench_sweep/spec_bench_datasets.yaml"),
+    Path("examples/speculative/bench_sweep/vlm_spec_bench_datasets.yaml"),
+    # Conda environment declarations used by the ViSpec reproduction guide.
+    Path("examples/speculative/vispec/environment-vllm.yml"),
+    Path("examples/speculative/vispec/environment.yml"),
 }
 
 RECIPE_TARGET_HELP = (

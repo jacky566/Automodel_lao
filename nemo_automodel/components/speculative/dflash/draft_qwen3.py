@@ -224,6 +224,37 @@ def extract_context_feature(hidden_states: list[torch.Tensor], layer_ids: list[i
     return torch.cat([hidden_states[layer_id + offset] for layer_id in layer_ids], dim=-1)
 
 
+def _prepend_text_position_ids(
+    multimodal_position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Add the text-position axis Qwen VL uses to construct its causal mask.
+
+    Args:
+        multimodal_position_ids: Tensor of shape [3, batch, sequence] containing
+            temporal, height, and width MRoPE positions.
+        attention_mask: Tensor of shape [batch, sequence], where nonzero entries
+            identify active tokens.
+
+    Returns:
+        Tensor of shape [4, batch, sequence]. Axis 0 contains monotonically
+        increasing text positions; axes 1-3 contain the input MRoPE positions.
+    """
+    if multimodal_position_ids.ndim != 3 or multimodal_position_ids.shape[0] != 3:
+        raise ValueError(
+            "Expected multimodal_position_ids with shape [3, batch, sequence], "
+            f"got {tuple(multimodal_position_ids.shape)}."
+        )
+    if attention_mask.ndim != 2 or tuple(attention_mask.shape) != tuple(multimodal_position_ids.shape[1:]):
+        raise ValueError(
+            "attention_mask must have shape [batch, sequence] matching multimodal_position_ids, "
+            f"got {tuple(attention_mask.shape)} and {tuple(multimodal_position_ids.shape)}."
+        )
+    text_position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    text_position_ids.masked_fill_(attention_mask == 0, 0)
+    return torch.cat((text_position_ids.unsqueeze(0), multimodal_position_ids), dim=0)
+
+
 class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
     """DFlash draft model: a small non-causal Qwen3 stack over ``[context | noise]``."""
 
@@ -329,6 +360,65 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 **kwargs,
             )
         return self.norm(hidden_states)
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Sample one speculative suffix, applying the Domino head when configured.
+
+        Args:
+            target: Target model that owns the token embedding and LM head used by
+                the draft checkpoint.
+            draft_hidden: Tensor of shape [batch, sequence, hidden] whose final
+                ``block`` positions contain the current DFlash hidden states.
+            block_output_ids: Tensor of shape [batch, block] whose first token is
+                the target-produced anchor and whose remaining positions are masks.
+                A cloned tensor is updated causally; the input is not mutated.
+
+        Returns:
+            Tensor of shape [batch, block - 1] containing the sampled draft suffix.
+        """
+        block_size = block_output_ids.shape[1]
+        if block_size != self.block_size:
+            raise ValueError(f"Expected a draft block of length {self.block_size}, got {block_size}.")
+        if draft_hidden.ndim != 3 or draft_hidden.shape[0] != block_output_ids.shape[0]:
+            raise ValueError(
+                "draft_hidden must have shape [batch, sequence, hidden] with the same batch as "
+                f"block_output_ids, got {tuple(draft_hidden.shape)} and {tuple(block_output_ids.shape)}."
+            )
+        if draft_hidden.shape[1] < block_size:
+            raise ValueError(
+                f"draft_hidden must contain at least {block_size} current-block positions, got {draft_hidden.shape[1]}."
+            )
+
+        current_hidden = draft_hidden[:, -block_size:, :]
+        if self.projector_type is None:
+            draft_logits = target.lm_head(current_hidden[:, 1:, :])
+            return sample(draft_logits)
+
+        completed_ids = block_output_ids.clone()
+        base_logits = target.lm_head(current_hidden)
+        suffix_start = self.pure_draft_prefix_len if self.shift_label else 1 + self.pure_draft_prefix_len
+        target_embeddings = target.get_input_embeddings()
+        gru_state = None
+
+        for token_position in range(1, block_size):
+            previous_token_ids = completed_ids[:, token_position - 1 : token_position]
+            prefix_state, gru_state = self.prefix_gru(target_embeddings(previous_token_ids), gru_state)
+            head_position = token_position - 1 if self.shift_label else token_position
+            next_token_logits = base_logits[:, head_position : head_position + 1, :]
+            if head_position >= suffix_start:
+                correction_features = torch.cat(
+                    (current_hidden[:, head_position : head_position + 1, :], prefix_state),
+                    dim=-1,
+                )
+                next_token_logits = next_token_logits + self.embed_proj(correction_features)
+            completed_ids[:, token_position] = sample(next_token_logits).squeeze(1)
+
+        return completed_ids[:, 1:]
 
     @torch.inference_mode()
     def spec_generate(
@@ -455,18 +545,20 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target_embeddings(block_output_ids)
             phase_start = start_timing()
-            draft_logits = target.lm_head(
-                self(
-                    target_hidden=target_hidden,
-                    noise_embedding=noise_embedding,
-                    position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
-                    past_key_values=past_key_values_draft,
-                    use_cache=True,
-                )[:, -block_size + 1 :, :]
+            draft_hidden = self(
+                target_hidden=target_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
+                past_key_values=past_key_values_draft,
+                use_cache=True,
+            )
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
             )
             end_timing("draft", phase_start)
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
             draft_tokens += int(block_output_ids.shape[1] - 1)
 
             if sequential_target_verification:
@@ -511,7 +603,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                         )
                         verify_input_ids = verify_kwargs.pop("input_ids")
                         verify_kwargs["attention_mask"] = full_attention_mask
-                        verify_kwargs["position_ids"] = target.model.compute_3d_position_ids(
+                        multimodal_position_ids = target.model.compute_3d_position_ids(
                             input_ids=token_ids,
                             image_grid_thw=None,
                             video_grid_thw=None,
@@ -519,6 +611,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                             attention_mask=full_attention_mask,
                             past_key_values=past_key_values_target,
                             mm_token_type_ids=None,
+                        )
+                        verify_kwargs["position_ids"] = _prepend_text_position_ids(
+                            multimodal_position_ids,
+                            full_attention_mask,
                         )[:, :, -1:]
                         if "cache_position" in target_forward_params:
                             verify_kwargs["cache_position"] = torch.tensor(
@@ -586,10 +682,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 # MRoPE positions. Omitting it makes the cache path fall back
                 # to plain arange positions and diverge from generate().
                 verify_kwargs["attention_mask"] = full_attention_mask
-                # ``compute_3d_position_ids`` returns positions for the full
-                # mask, while the cache path consumes only the new block.
-                # Slice the tail before passing them to the VLM.
-                verify_kwargs["position_ids"] = target.model.compute_3d_position_ids(
+                # ``compute_3d_position_ids`` returns the three MRoPE axes for
+                # the full mask. The fourth text-position axis is required by
+                # the current Transformers causal-mask path.
+                multimodal_position_ids = target.model.compute_3d_position_ids(
                     input_ids=block_output_ids,
                     image_grid_thw=None,
                     video_grid_thw=None,
@@ -597,6 +693,10 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                     attention_mask=full_attention_mask,
                     past_key_values=past_key_values_target,
                     mm_token_type_ids=None,
+                )
+                verify_kwargs["position_ids"] = _prepend_text_position_ids(
+                    multimodal_position_ids,
+                    full_attention_mask,
                 )[:, :, -block_output_ids.shape[1] :]
                 if "cache_position" in target_forward_params:
                     verify_kwargs["cache_position"] = torch.arange(

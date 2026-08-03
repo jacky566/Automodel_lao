@@ -20,7 +20,10 @@
 #   uv run python -m nemo_automodel.components.speculative.regenerate_vlm \
 #     --model Qwen/Qwen2.5-VL-7B-Instruct \
 #     --dataset liuhaotian/LLaVA-Pretrain --image-root /data/LLaVA-Pretrain \
-#     --output-dir /data/vispec_stage2 --end 68000 --image-max-pixels 802816
+#     --output-dir /data/vispec_stage2 --end 68000 \
+#     --image-min-pixels 200704 --image-max-pixels 1003520 \
+#     --temperature 1 \
+#     --engine vllm --batch-size 512 --tensor-parallel-size 1
 #
 # and point `dataset.path_or_dataset` at the `meta.json` it writes.
 #
@@ -55,7 +58,8 @@ recipe_args:
   # step contributes an exactly-zero loss. 1024 * 28 * 28 is roughly 1024 vision
   # tokens per image, a quarter of the budget. Watch train/valid_tokens: a run
   # that logs 0 there is supervising nothing.
-  image_max_pixels: 802816
+  image_min_pixels: 200704
+  image_max_pixels: 1003520
   micro_batch_size: 1
   grad_accumulation_steps: 8
   num_workers: 4

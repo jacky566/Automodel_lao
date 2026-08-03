@@ -19,10 +19,12 @@ from __future__ import annotations
 from copy import deepcopy
 
 import torch
+import torch.nn as nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
+    _prepend_text_position_ids,
     build_target_layer_ids,
     extract_context_feature,
 )
@@ -46,6 +48,24 @@ def test_extract_context_feature_uses_offset_one():
     # first 3 features come from hidden_states[2], next 3 from hidden_states[4]
     assert torch.allclose(out[..., :3], torch.full((1, 2, 3), 2.0))
     assert torch.allclose(out[..., 3:], torch.full((1, 2, 3), 4.0))
+
+
+def test_prepend_text_position_ids_adds_causal_mask_axis() -> None:
+    """Qwen-VL decode positions include text plus three MRoPE axes."""
+    multimodal = torch.tensor(
+        [
+            [[7, 8, 9, 10]],
+            [[11, 12, 13, 14]],
+            [[15, 16, 17, 18]],
+        ]
+    )
+    attention_mask = torch.tensor([[0, 1, 1, 1]])
+
+    position_ids = _prepend_text_position_ids(multimodal, attention_mask)
+
+    assert position_ids.shape == (4, 1, 4)
+    torch.testing.assert_close(position_ids[0], torch.tensor([[0, 0, 1, 2]]))
+    torch.testing.assert_close(position_ids[1:], multimodal)
 
 
 def _draft_cfg(bs=4):
@@ -127,6 +147,22 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+def test_plain_dflash_sampling_keeps_parallel_suffix_logits() -> None:
+    """A non-Domino checkpoint samples all suffix positions from one LM-head result."""
+    torch.manual_seed(13)
+    draft = Qwen3DFlashDraftModel(_draft_cfg()).eval()
+    target = nn.Module()
+    target.lm_head = nn.Linear(32, 64, bias=False)
+    draft_hidden = torch.randn(1, 4, 32)
+    block_ids = torch.tensor([[5, 63, 63, 63]])
+
+    with torch.inference_mode():
+        expected = target.lm_head(draft_hidden[:, 1:, :]).argmax(dim=-1)
+        actual = draft._sample_draft_tokens(target, draft_hidden, block_ids)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_draft_sdpa_matches_eager_in_fp32():

@@ -1,9 +1,9 @@
-# DFlash draft training for a Qwen2.5-VL target. The target performs normal
-# image encoding; the text-only Qwen3-style draft consumes selected language
-# decoder hidden states and is supervised only on assistant-response tokens.
-# Regenerate the responses with the same target model before training.
+# Domino draft training for the Qwen2.5-VL-7B target. All shared training,
+# data, optimizer, batching, and checkpoint-cadence parameters match
+# qwen2_5_vl_dflash.yaml. Domino adds only its causal correction head and
+# base-anchor curriculum. Training starts from a fresh draft checkpoint.
 
-recipe: TrainDFlashRecipe
+recipe: TrainDominoRecipe
 
 dist_env:
   backend: nccl
@@ -11,7 +11,7 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: /data/models/Qwen2.5-VL-7B-Instruct
-  output_dir: /data/runs/dflash_qwen2_5_vl_7b
+  output_dir: /data/runs/domino_qwen2_5_vl_7b
   seq_length: 3072
   image_min_pixels: 200704
   image_max_pixels: 1003520
@@ -20,12 +20,23 @@ recipe_args:
   num_workers: 4
   num_epochs: 6
 
+  # DFlash backbone: identical to yesterday's Qwen2.5-VL DFlash run.
   draft_num_hidden_layers: 3
   block_size: 8
   num_anchors: 256
   loss_decay_gamma: 7.0
   mask_token_id: 151669
   attention_backend: flex_attention
+
+  # Domino causal correction head.
+  emb_dim: 256
+  gru_hidden_dim: 1024
+  pure_draft_prefix_len: 1
+  shift_label: true
+
+  # Linearly decay the backbone-only loss weight from 1 to 0 over training.
+  lambda_base_start: 1.0
+  lambda_base_decay_ratio: 1.0
 
   trust_remote_code: false
   target_attn_implementation: sdpa
@@ -52,14 +63,14 @@ compile:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /data/runs/dflash_qwen2_5_vl_7b/checkpoints
+  checkpoint_dir: /data/runs/domino_qwen2_5_vl_7b/checkpoints
   model_save_format: safetensors
   save_consolidated: final
   max_recent_checkpoints: 2
 
 wandb:
   enable: false
-  project: dflash-qwen2-5-vl
-  name: qwen2-5-vl-7b-dflash-b8-a256
+  project: domino-qwen2-5-vl
+  name: qwen2-5-vl-7b-domino-bs28-a256
   mode: offline
-  dir: /data/runs/dflash_qwen2_5_vl_7b/wandb
+  dir: /data/runs/domino_qwen2_5_vl_7b/wandb

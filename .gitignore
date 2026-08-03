@@ -196,3 +196,7 @@ docs/fern/versions/v0.4/pages/
 docs/fern/versions/v0.5/pages/
 
 training_logs/
+
+# Local model checkpoints
+/checkpoints/
+/domino_checkpoints/

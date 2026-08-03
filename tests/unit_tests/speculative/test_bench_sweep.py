@@ -137,8 +137,14 @@ def test_shipped_vlm_example_config_loads():
     repo_root = pathlib.Path(bench_sweep.__file__).resolve().parents[3]
     example = repo_root / "examples" / "speculative" / "bench_sweep" / "vlm_spec_bench_datasets.yaml"
     specs = _load_dataset_specs(str(example))
-    assert [s.name for s in specs] == ["gqa", "textvqa", "coco_caption", "charxiv_reasoning", "mmmu_pro"]
+    assert [s.name for s in specs] == [
+        "scienceqa",
+        "mmvet",
+        "textvqa",
+        "coco_caption",
+    ]
     assert all(spec.benchmark_adapter for spec in specs)
+    assert all(spec.max_new_tokens == 512 for spec in specs)
 
 
 # ---------------------------------------------------------------------------

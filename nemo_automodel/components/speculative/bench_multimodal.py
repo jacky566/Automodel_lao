@@ -16,10 +16,8 @@
 
 from __future__ import annotations
 
-import ast
 import base64
 import io
-import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -28,11 +26,14 @@ from typing import Any, Callable, Iterable
 class MultimodalBenchmark(str, Enum):
     """Supported benchmark row schemas."""
 
-    GQA = "gqa"
+    SCIENCEQA = "scienceqa"
+    MMVET = "mmvet"
     TEXTVQA = "textvqa"
+    MME = "mme"
     COCO_CAPTION = "coco_caption"
-    CHARXIV_REASONING = "charxiv_reasoning"
-    MMMU_PRO = "mmmu_pro"
+    VIZWIZ = "vizwiz"
+    GQA = "gqa"
+    SEED_BENCH = "seed_bench"
 
 
 def _image_data_url(image: Any) -> str:
@@ -72,64 +73,66 @@ def _image_data_url(image: Any) -> str:
     raise ValueError(f"Unsupported image value of type {type(image).__name__}")
 
 
-def _vision_message(text: str, images: list[Any]) -> list[dict[str, Any]] | None:
-    """Build one OpenAI Vision user message, preserving numbered image positions."""
-    if not isinstance(text, str) or not text.strip() or not images:
+def _benchmark_prompt(text: str | None, image: Any, instruction: str) -> list[dict[str, Any]] | None:
+    """Build one single-image benchmark conversation without a system message."""
+    if not isinstance(text, str) or not text.strip() or image is None:
         return None
-
-    image_urls = [_image_data_url(image) for image in images]
-    parts: list[dict[str, Any]] = []
-    cursor = 0
-    used: set[int] = set()
-    for match in re.finditer(r"<image\s+(\d+)>", text, flags=re.IGNORECASE):
-        if match.start() > cursor and text[cursor : match.start()].strip():
-            parts.append({"type": "text", "text": text[cursor : match.start()]})
-        image_index = int(match.group(1)) - 1
-        if 0 <= image_index < len(image_urls):
-            parts.append({"type": "image_url", "image_url": {"url": image_urls[image_index]}})
-            used.add(image_index)
-        cursor = match.end()
-
-    if cursor == 0:
-        parts.extend({"type": "image_url", "image_url": {"url": url}} for url in image_urls)
-    else:
-        parts.extend(
-            {"type": "image_url", "image_url": {"url": url}}
-            for index, url in enumerate(image_urls)
-            if index not in used
-        )
-    if text[cursor:].strip():
-        parts.append({"type": "text", "text": text[cursor:]})
-    return [{"role": "user", "content": parts}]
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": text.strip()}]
+    if instruction:
+        user_content.append({"type": "text", "text": instruction})
+    user_content.append({"type": "image_url", "image_url": {"url": _image_data_url(image)}})
+    return [{"role": "user", "content": user_content}]
 
 
-def _parse_options(value: Any) -> list[str]:
-    """Normalize MMMU-Pro's serialized options list."""
-    if isinstance(value, str):
-        try:
-            value = ast.literal_eval(value)
-        except (SyntaxError, ValueError):
-            return []
-    if not isinstance(value, list) or not all(isinstance(option, str) for option in value):
-        return []
-    return value
+def _multiple_choice_text(row: dict[str, Any]) -> str | None:
+    """Format a ScienceQA or SEED-Bench row as an explained multiple choice task."""
+    question = row.get("question")
+    choices = row.get("choices")
+    if choices is None:
+        choices = [row.get(f"choice_{label.lower()}") for label in "ABCD"]
+        choices = [choice for choice in choices if isinstance(choice, str) and choice]
+    if not isinstance(question, str) or not isinstance(choices, list) or not choices:
+        return None
+    labels = [chr(ord("A") + index) for index in range(len(choices))]
+    options = " ".join(f"({label}) {choice}" for label, choice in zip(labels, choices))
+    hint = row.get("hint")
+    context = hint.strip() if isinstance(hint, str) and hint.strip() else "N/A"
+    return (
+        f"Context: {context}\nQuestion: {question}\nOptions: {options}\n"
+        'Your answer should begin with "The answer is". Please answer with an explanation. Answer:'
+    )
 
 
 def adapt_multimodal_row(row: dict[str, Any], benchmark: MultimodalBenchmark) -> list[dict[str, Any]] | None:
     """Convert one supported benchmark row into OpenAI Vision messages."""
-    if benchmark in {MultimodalBenchmark.GQA, MultimodalBenchmark.TEXTVQA, MultimodalBenchmark.COCO_CAPTION}:
-        return _vision_message(row.get("question"), [row.get("image")] if row.get("image") is not None else [])
-    if benchmark is MultimodalBenchmark.CHARXIV_REASONING:
-        return _vision_message(row.get("reasoning_q"), [row.get("image")] if row.get("image") is not None else [])
-    if benchmark is MultimodalBenchmark.MMMU_PRO:
-        options = _parse_options(row.get("options"))
-        if not options:
+    if benchmark is MultimodalBenchmark.SCIENCEQA:
+        return _benchmark_prompt(_multiple_choice_text(row), row.get("image"), "")
+    if benchmark is MultimodalBenchmark.TEXTVQA:
+        return _benchmark_prompt(
+            row.get("question"),
+            row.get("image"),
+            "Perform an OCR task on the provided image. Please extract the text accurately and provide a detailed "
+            "explanation of the process. Ensure the response is comprehensive and well-structured.",
+        )
+    if benchmark is MultimodalBenchmark.COCO_CAPTION:
+        return _benchmark_prompt(
+            "Please provide a detailed description of the given image.",
+            row.get("image"),
+            "",
+        )
+    if benchmark is MultimodalBenchmark.SEED_BENCH:
+        images = row.get("image")
+        if row.get("data_type") != "image" or not isinstance(images, list) or not images:
             return None
-        labels = [chr(ord("A") + index) for index in range(len(options))]
-        options_text = "\n".join(f"{label}. {option}" for label, option in zip(labels, options))
-        question = f"{row.get('question', '')}\n\nOptions:\n{options_text}\nAnswer with the option letter only."
-        images = [row.get(f"image_{index}") for index in range(1, 8)]
-        return _vision_message(question, [image for image in images if image is not None])
+        return _benchmark_prompt(_multiple_choice_text(row), images[0], "")
+    if benchmark in {
+        MultimodalBenchmark.MMVET,
+        MultimodalBenchmark.MME,
+        MultimodalBenchmark.VIZWIZ,
+        MultimodalBenchmark.GQA,
+    }:
+        question = row.get("text") if benchmark is MultimodalBenchmark.GQA else row.get("question")
+        return _benchmark_prompt(question, row.get("image"), "Please answer with an explanation.")
     raise ValueError(f"Unsupported multimodal benchmark: {benchmark}")
 
 
@@ -150,19 +153,40 @@ def load_multimodal_prompts(
     if benchmark is MultimodalBenchmark.GQA:
         if not args.dataset_name or not args.dataset_name.endswith("_instructions"):
             raise ValueError("GQA requires an *_instructions dataset_name so its matching image config can be joined.")
+        instruction_rows = []
+        needed_image_ids = set()
+        for row in rows:
+            instruction_rows.append(row)
+            needed_image_ids.add(row.get("imageId"))
+            if len(instruction_rows) >= args.num_prompts:
+                break
+        rows = instruction_rows
         image_rows = load_rows(
             args.input_data,
             split=args.split,
             name=args.dataset_name.removesuffix("_instructions") + "_images",
             shuffle_seed=None,
         )
-        image_by_id = {row["id"]: row["image"] for row in image_rows}
+        image_by_id = {}
+        for row in image_rows:
+            image_id = row.get("id")
+            if image_id in needed_image_ids:
+                image_by_id[image_id] = row.get("image")
+                if len(image_by_id) == len(needed_image_ids):
+                    break
 
     prompts: list[list[dict[str, Any]]] = []
+    seen_coco_ids: set[Any] = set()
     for raw_row in rows:
         row = dict(raw_row)
         if image_by_id is not None:
             row["image"] = image_by_id.get(row.get("imageId"))
+            row["text"] = row.get("question")
+        if benchmark is MultimodalBenchmark.COCO_CAPTION:
+            image_id = row.get("id")
+            if image_id in seen_coco_ids:
+                continue
+            seen_coco_ids.add(image_id)
         prompt = adapt_multimodal_row(row, benchmark)
         if prompt is not None:
             prompts.append(prompt)

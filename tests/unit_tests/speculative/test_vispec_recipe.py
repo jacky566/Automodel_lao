@@ -338,6 +338,113 @@ class TestRegenerateVlm:
         with pytest.raises(ValueError, match="must be greater than"):
             regenerate_vlm.main(argv)
 
+    @pytest.mark.parametrize(
+        ("flag", "value", "message"),
+        [
+            ("--batch-size", "0", "must be positive"),
+            ("--tensor-parallel-size", "0", "must be positive"),
+            ("--gpu-memory-utilization", "1.1", "must be in"),
+            ("--max-model-len", "0", "must be positive"),
+        ],
+    )
+    def test_main_rejects_invalid_vllm_limits(self, flag, value, message):
+        argv = [
+            "--model",
+            "m",
+            "--dataset",
+            "d",
+            "--image-root",
+            "/i",
+            "--output-dir",
+            "/o",
+            flag,
+            value,
+        ]
+        with pytest.raises(ValueError, match=message):
+            regenerate_vlm.main(argv)
+
+    def test_vllm_generator_batches_multimodal_requests(self, monkeypatch):
+        calls = {}
+
+        class _FakeImage:
+            def convert(self, mode):
+                calls.setdefault("image_modes", []).append(mode)
+                return self
+
+            def close(self):
+                calls["closed"] = calls.get("closed", 0) + 1
+
+        class _FakeOutput:
+            def __init__(self, text):
+                self.outputs = [type("Candidate", (), {"text": text})()]
+
+        class _FakeLlm:
+            def __init__(self, **kwargs):
+                calls["engine"] = kwargs
+
+            def generate(self, requests, **kwargs):
+                calls["requests"] = requests
+                calls["generate"] = kwargs
+                return [_FakeOutput(" first "), _FakeOutput("second")]
+
+        class _FakeVllm:
+            LLM = _FakeLlm
+
+            class SamplingParams:
+                def __init__(self, **kwargs):
+                    calls["sampling"] = kwargs
+
+        class _FakeProcessor:
+            def apply_chat_template(self, messages, **kwargs):
+                calls.setdefault("messages", []).append((messages, kwargs))
+                return f"prompt-{len(calls['messages'])}"
+
+        monkeypatch.setattr(regenerate_vlm, "HAVE_VLLM", True)
+        monkeypatch.setattr(regenerate_vlm, "VLLM", _FakeVllm)
+        monkeypatch.setattr(regenerate_vlm.torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(regenerate_vlm.PIL_Image, "open", lambda path: _FakeImage())
+        config = regenerate_vlm.RegenerationConfig(
+            model="Qwen/Qwen2.5-VL-7B-Instruct",
+            dataset="d",
+            split="train",
+            image_root="/images",
+            output_dir="/out",
+            start=0,
+            end=2,
+            max_new_tokens=1024,
+            temperature=0.0,
+            shuffle_seed=42,
+            length_instruction=regenerate_vlm.LENGTH_INSTRUCTION,
+            image_max_pixels=802816,
+            engine="vllm",
+            batch_size=2,
+            tensor_parallel_size=2,
+            gpu_memory_utilization=0.8,
+        )
+        generator = config.build(processor=_FakeProcessor())
+        samples = [
+            regenerate_vlm._PreparedSample("one", "a.jpg", "/images/a.jpg", [{"type": "image"}]),
+            regenerate_vlm._PreparedSample("two", "b.jpg", "/images/b.jpg", [{"type": "image"}]),
+        ]
+
+        assert generator.generate(samples) == ["first", "second"]
+        assert calls["engine"] == {
+            "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+            "tensor_parallel_size": 2,
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 4096,
+            "max_num_seqs": 2,
+            "limit_mm_per_prompt": {"image": 1},
+            "trust_remote_code": False,
+            "seed": 42,
+            "mm_processor_kwargs": {"max_pixels": 802816},
+        }
+        assert [request["prompt"] for request in calls["requests"]] == ["prompt-1", "prompt-2"]
+        assert all("image" in request["multi_modal_data"] for request in calls["requests"])
+        assert calls["sampling"] == {"temperature": 0.0, "max_tokens": 1024}
+        assert calls["generate"] == {"sampling_params": generator._sampling_params, "use_tqdm": False}
+        assert calls["closed"] == 2
+
     def test_regenerate_stores_the_exact_generation_prompt(self, tmp_path, monkeypatch):
         """The stored prompt must rebuild the prompt the answer was sampled under.
 

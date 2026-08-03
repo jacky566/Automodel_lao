@@ -55,6 +55,17 @@ def test_linter_exempts_command_only_precompute_configs():
         assert errors == []
 
 
+def test_linter_exempts_speculative_support_yamls():
+    """Benchmark dataset lists and Conda environments are not recipe configs."""
+    paths_and_text = {
+        Path("examples/speculative/bench_sweep/vlm_spec_bench_datasets.yaml"): "datasets: []\n",
+        Path("examples/speculative/vispec/environment-vllm.yml"): "name: automodel-vllm\n",
+        Path("examples/speculative/vispec/environment.yml"): "name: automodel\n",
+    }
+    for path, text in paths_and_text.items():
+        assert lint_yaml_text(text, path, Path.cwd()) == []
+
+
 def test_linter_requires_recipe_first():
     errors = lint_yaml_text(
         "step_scheduler: {}\nrecipe: TrainFinetuneRecipeForNextTokenPrediction\n",
