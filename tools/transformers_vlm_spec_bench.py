@@ -25,6 +25,7 @@ import argparse
 import inspect
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor,
 from transformers.cache_utils import DynamicCache
 
 FIXED_NEW_TOKENS = 512
+LEGACY_NEW_TOKENS = 256
 REPRESENTATIVE_BENCHMARKS = (
     "scienceqa",
     "mmvet",
@@ -43,24 +45,41 @@ REPRESENTATIVE_BENCHMARKS = (
     "coco_caption",
 )
 BENCHMARK_CONFIG = Path(__file__).parents[1] / "examples/speculative/bench_sweep/vlm_spec_bench_datasets.yaml"
+LEGACY_BENCHMARK_CONFIG = (
+    Path(__file__).parents[1] / "examples/speculative/bench_sweep/vlm_spec_bench_datasets_legacy_256.yaml"
+)
+LEGACY_BENCHMARKS = (
+    "gqa",
+    "textvqa",
+    "coco_caption",
+    "charxiv_reasoning",
+    "mmmu_pro",
+)
+TEXT_BENCHMARK_CONFIG = Path(__file__).parents[1] / "examples/speculative/bench_sweep/text_spec_bench_datasets_256.yaml"
+TEXT_BENCHMARKS = ("mt_bench", "humaneval", "gsm8k", "alpaca")
 VISPEC_DEPTH = 3
 VISPEC_TOP_K = 8
 VISPEC_TOTAL_TOKEN = 30
+POSITION_BUCKETS = ((1, 32), (33, 64), (65, 128), (129, 256), (257, 512))
 logger = logging.getLogger(__name__)
 
 
-def _load_benchmark_specs(path: Path = BENCHMARK_CONFIG) -> list[dict[str, Any]]:
-    """Load and validate the representative four-dataset ViSpec suite."""
+def _load_benchmark_specs(
+    path: Path = BENCHMARK_CONFIG,
+    expected_benchmarks: tuple[str, ...] = REPRESENTATIVE_BENCHMARKS,
+    expected_max_new_tokens: int = FIXED_NEW_TOKENS,
+) -> list[dict[str, Any]]:
+    """Load and validate an ordered VLM benchmark suite."""
     payload = yaml.safe_load(path.read_text())
     specs = payload.get("datasets") if isinstance(payload, dict) else None
     if not isinstance(specs, list):
         raise ValueError(f"Benchmark config must contain a datasets list: {path}")
     names = tuple(spec.get("name") for spec in specs if isinstance(spec, dict))
-    if names != REPRESENTATIVE_BENCHMARKS:
-        raise ValueError(f"Expected representative ViSpec benchmarks {REPRESENTATIVE_BENCHMARKS}, got {names}.")
-    invalid_lengths = [spec.get("name") for spec in specs if spec.get("max_new_tokens") != FIXED_NEW_TOKENS]
+    if names != expected_benchmarks:
+        raise ValueError(f"Expected VLM benchmarks {expected_benchmarks}, got {names}.")
+    invalid_lengths = [spec.get("name") for spec in specs if spec.get("max_new_tokens") != expected_max_new_tokens]
     if invalid_lengths:
-        raise ValueError(f"Official benchmarks must all generate {FIXED_NEW_TOKENS} tokens: {invalid_lengths}")
+        raise ValueError(f"Official benchmarks must all generate {expected_max_new_tokens} tokens: {invalid_lengths}")
     return specs
 
 
@@ -93,6 +112,36 @@ def _load_official_prompts(spec: dict[str, Any], num_prompts: int) -> list[list[
         num_prompts=num_prompts,
     )
     prompts = load_multimodal_prompts(prompt_args, _load_hf_rows)
+    if len(prompts) != num_prompts:
+        raise ValueError(
+            f"Benchmark {spec['name']} provided {len(prompts)} valid prompts; {num_prompts} were requested."
+        )
+    return prompts
+
+
+def _load_text_prompts(spec: dict[str, Any], num_prompts: int) -> list[list[dict[str, Any]]]:
+    """Load deterministic single-turn prompts from a text benchmark."""
+    rows = _load_hf_rows(
+        spec["input_data"],
+        split=spec.get("split", "test"),
+        name=spec.get("dataset_name"),
+        shuffle_seed=None,
+    )
+    prompts: list[list[dict[str, Any]]] = []
+    prompt_column = spec["prompt_column"]
+    context_column = spec.get("prompt_context_column")
+    for row in rows:
+        prompt = row.get(prompt_column)
+        if isinstance(prompt, list):
+            prompt = prompt[0] if prompt else None
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        context = row.get(context_column) if context_column is not None else None
+        if isinstance(context, str) and context.strip():
+            prompt = f"{prompt.rstrip()}\n\n{context.strip()}"
+        prompts.append([{"role": "user", "content": [{"type": "text", "text": prompt}]}])
+        if len(prompts) == num_prompts:
+            break
     if len(prompts) != num_prompts:
         raise ValueError(
             f"Benchmark {spec['name']} provided {len(prompts)} valid prompts; {num_prompts} were requested."
@@ -279,6 +328,70 @@ def _acceptance_lengths(accepted_tokens: int | float, verify_steps: int | float)
     return accept_length, 1.0 + accept_length
 
 
+def _aggregate_position_acceptance(
+    events: list[dict[str, int]],
+    max_new_tokens: int,
+) -> dict[str, dict[str, int | float | None]]:
+    """Aggregate verification acceptance by one-based round-start position.
+
+    Each speculative verification round is assigned to the bucket containing
+    its anchor's generated-token position. This preserves the existing
+    accepted-tokens-per-verification-step definition within every bucket.
+
+    Args:
+        events: Per-round position, accepted-token, and draft-token counters.
+        max_new_tokens: Maximum number of generated tokens in each sample.
+
+    Returns:
+        Position labels mapped to verification counts and acceptance metrics.
+    """
+    aggregated: dict[str, dict[str, int | float | None]] = {}
+    for lower, upper in POSITION_BUCKETS:
+        if lower > max_new_tokens:
+            continue
+        clipped_upper = min(upper, max_new_tokens)
+        bucket_events = [event for event in events if lower <= event["generated_position"] <= clipped_upper]
+        verify_steps = len(bucket_events)
+        accepted_tokens = sum(event["accepted_tokens"] for event in bucket_events)
+        draft_tokens = sum(event["draft_tokens"] for event in bucket_events)
+        accept_length, emitted_tokens_per_step = _acceptance_lengths(accepted_tokens, verify_steps)
+        aggregated[f"{lower}-{clipped_upper}"] = {
+            "verify_steps": verify_steps,
+            "accepted_tokens": accepted_tokens,
+            "draft_tokens": draft_tokens,
+            "accept_length": accept_length,
+            "emitted_tokens_per_step": emitted_tokens_per_step,
+            "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
+        }
+    return aggregated
+
+
+def _aggregate_proposal_offset_acceptance(
+    events: list[dict[str, int]],
+) -> dict[str, dict[str, int | float | None]]:
+    """Aggregate prefix acceptance for each draft offset after the anchor.
+
+    Args:
+        events: Per-round accepted-token and in-range draft-token counters. An
+            event with ``accepted_tokens >= k`` accepted proposal offset ``k``.
+
+    Returns:
+        One-based proposal offsets mapped to opportunities, accepted counts,
+        and acceptance rates.
+    """
+    max_offset = max((event["draft_tokens"] for event in events), default=0)
+    aggregated: dict[str, dict[str, int | float | None]] = {}
+    for offset in range(1, max_offset + 1):
+        opportunities = sum(event["draft_tokens"] >= offset for event in events)
+        accepted = sum(event["accepted_tokens"] >= offset for event in events)
+        aggregated[str(offset)] = {
+            "opportunities": opportunities,
+            "accepted": accepted,
+            "acceptance_rate": accepted / opportunities if opportunities else None,
+        }
+    return aggregated
+
+
 def _greedy_cached_forward(
     target: nn.Module,
     model_inputs: dict[str, torch.Tensor],
@@ -456,7 +569,36 @@ def _baseline(
     }
 
 
-def _load_dflash(path: str, target, device: torch.device):
+def _scale_visual_gate_state_dict(state_dict: dict[str, torch.Tensor], multiplier: float) -> None:
+    """Scale the pooled-MLP visual gates in a loaded DFlash state dict.
+
+    Args:
+        state_dict: Mapping of checkpoint names to tensors of arbitrary shape. Entries
+            ending in ``.visual_fusion.gate`` must be scalar tensors and are replaced
+            with independently scaled tensors; all other entries remain unchanged.
+        multiplier: Non-negative finite scale applied to every visual gate.
+
+    Raises:
+        ValueError: If the multiplier is invalid or the state dict has no visual gates.
+    """
+    if not math.isfinite(multiplier) or multiplier < 0:
+        raise ValueError(f"visual gate multiplier must be finite and non-negative, got {multiplier}.")
+    gate_keys = [key for key in state_dict if key.endswith(".visual_fusion.gate")]
+    if not gate_keys:
+        raise ValueError("visual gate multiplier requires a DFlash checkpoint with visual_fusion.gate tensors.")
+    for key in gate_keys:
+        if state_dict[key].numel() != 1:
+            raise ValueError(f"Expected scalar visual gate tensor for {key}, got shape {tuple(state_dict[key].shape)}.")
+        state_dict[key] = state_dict[key] * multiplier
+
+
+def _load_dflash(
+    path: str,
+    target,
+    device: torch.device,
+    *,
+    visual_gate_multiplier: float = 1.0,
+):
     from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
     config = AutoConfig.from_pretrained(path)
@@ -470,6 +612,8 @@ def _load_dflash(path: str, target, device: torch.device):
     state_dict = {}
     for weight_file in weight_files:
         state_dict.update(load_file(str(weight_file)))
+    if visual_gate_multiplier != 1.0:
+        _scale_visual_gate_state_dict(state_dict, visual_gate_multiplier)
     draft.load_state_dict(state_dict, strict=True)
     return draft.to(device=device, dtype=next(target.parameters()).dtype).eval()
 
@@ -487,6 +631,7 @@ def _dflash(
     verification_mode: str = "block",
     *,
     benchmark_name: str = "benchmark",
+    draft_image_context_mode: str = "keep",
 ) -> dict[str, Any]:
     """Run DFlash's block verifier with prompt-only multimodal target inputs."""
     output_tokens = 0
@@ -500,6 +645,8 @@ def _dflash(
     target_prefill_seconds = 0.0
     draft_seconds = 0.0
     target_verify_seconds = 0.0
+    acceptance_events: list[dict[str, int]] = []
+    draft_image_token_id = int(getattr(target.config, "image_token_id")) if draft_image_context_mode != "keep" else None
     if prompts:
         warmup_inputs = _prepare_inputs(processor, prompts[0], device)
         warmup_ids = warmup_inputs.pop("input_ids")
@@ -511,6 +658,8 @@ def _dflash(
             temperature=0.0,
             target_kwargs=warmup_inputs,
             sequential_target_verification=verification_mode == "sequential",
+            draft_image_context_mode=draft_image_context_mode,
+            draft_image_token_id=draft_image_token_id,
         )
     _sync(device)
     start = time.perf_counter()
@@ -543,6 +692,8 @@ def _dflash(
             target_kwargs=inputs,
             return_stats=True,
             sequential_target_verification=verification_mode == "sequential",
+            draft_image_context_mode=draft_image_context_mode,
+            draft_image_token_id=draft_image_token_id,
         )
         generated_length = int(output.shape[1] - prompt_ids.shape[1])
         if fixed_output_length and generated_length != sample_max_new_tokens:
@@ -564,6 +715,7 @@ def _dflash(
         draft_tokens += stats["draft_tokens"]
         accepted_tokens += stats["accepted_tokens"]
         verify_steps += stats["verify_steps"]
+        acceptance_events.extend(stats["acceptance_events"])
         target_prefill_seconds += stats["target_prefill_seconds"]
         draft_seconds += stats["draft_seconds"]
         target_verify_seconds += stats["target_verify_seconds"]
@@ -586,6 +738,11 @@ def _dflash(
         "accept_length": accept_length,
         "emitted_tokens_per_step": emitted_tokens_per_step,
         "acceptance_rate": accepted_tokens / draft_tokens if draft_tokens else None,
+        "position_acceptance_by_round_start": _aggregate_position_acceptance(
+            acceptance_events,
+            max_new_tokens,
+        ),
+        "proposal_offset_acceptance": _aggregate_proposal_offset_acceptance(acceptance_events),
         "exact_match_count": exact_matches if reference_outputs is not None else None,
         "exact_match_rate": exact_matches / len(prompts) if reference_outputs is not None and prompts else None,
         "token_match_rate": matching_tokens / compared_tokens
@@ -636,8 +793,26 @@ def _vispec(
     fixed_output_length: bool = False,
     *,
     benchmark_name: str = "benchmark",
+    proposal_mode: str = "tree",
 ) -> dict[str, Any]:
-    """Run batch-one ViSpec/MSD rounds with cached target verification."""
+    """Run batch-one ViSpec/MSD rounds with cached target verification.
+
+    Args:
+        target: Target VLM used to verify each proposal.
+        processor: Multimodal processor paired with the target.
+        draft: ViSpec draft model used to construct proposals.
+        prompts: Batch-one multimodal conversations.
+        max_new_tokens: Maximum generated tokens per prompt.
+        device: Device used for target and draft inference.
+        reference_outputs: Optional target token IDs used for parity metrics.
+        fixed_output_length: Whether every prompt emits exactly ``max_new_tokens``.
+        benchmark_name: Benchmark name included in progress logs.
+        proposal_mode: ``tree`` keeps ViSpec's multi-branch proposal; ``chain``
+            retains only the top-1 token at each draft step.
+
+    Returns:
+        Aggregate throughput, acceptance, and optional parity metrics.
+    """
     from nemo_automodel.components.speculative.eagle.vispec_decode import VispecCachedGreedyDecoder
     from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
 
@@ -645,6 +820,8 @@ def _vispec(
     vispec_target = HFVispecTargetModel(target, image_token_id=image_token_id)
 
     decoder = VispecCachedGreedyDecoder(vispec_target, draft)
+    proposal_top_k = VISPEC_TOP_K if proposal_mode == "tree" else 1
+    proposal_beam_width = VISPEC_TOTAL_TOKEN - 1 if proposal_mode == "tree" else VISPEC_DEPTH + 1
     output_tokens = 0
     draft_tokens = 0
     accepted_tokens = 0
@@ -658,8 +835,8 @@ def _vispec(
         decoder.prefill(warmup_inputs)
         decoder.decode_round(
             draft_steps=VISPEC_DEPTH,
-            top_k=VISPEC_TOP_K,
-            beam_width=VISPEC_TOTAL_TOKEN - 1,
+            top_k=proposal_top_k,
+            beam_width=proposal_beam_width,
         )
     _sync(device)
     start = time.perf_counter()
@@ -682,8 +859,8 @@ def _vispec(
         while generated < sample_max_new_tokens:
             proposal, result = decoder.decode_round(
                 draft_steps=VISPEC_DEPTH,
-                top_k=VISPEC_TOP_K,
-                beam_width=VISPEC_TOTAL_TOKEN - 1,
+                top_k=proposal_top_k,
+                beam_width=proposal_beam_width,
             )
             emitted = list(result.accepted_token_ids[: sample_max_new_tokens - generated])
             eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
@@ -762,11 +939,40 @@ def main() -> None:
     parser.add_argument("--draft-layers", type=int, choices=(1, 3, 5))
     parser.add_argument("--attn-implementation", choices=("eager", "sdpa"), default="eager")
     parser.add_argument("--verification-mode", choices=("block", "sequential"), default="block")
-    parser.add_argument("--only", choices=REPRESENTATIVE_BENCHMARKS)
+    parser.add_argument(
+        "--visual-gate-multiplier",
+        type=float,
+        default=1.0,
+        help="DFlash pooled-MLP ablation: multiply checkpoint visual gates after loading.",
+    )
+    parser.add_argument(
+        "--draft-image-context-mode",
+        choices=("keep", "zero", "shuffle"),
+        default="keep",
+        help="DFlash diagnostic: preserve, zero, or reorder image-token target features only on the draft side.",
+    )
+    parser.add_argument(
+        "--vispec-proposal-mode",
+        choices=("tree", "chain"),
+        default="tree",
+        help="Use the default multi-branch ViSpec tree or a top-1 chain ablation.",
+    )
+    parser.add_argument("--only", choices=REPRESENTATIVE_BENCHMARKS + LEGACY_BENCHMARKS + TEXT_BENCHMARKS)
+    parser.add_argument(
+        "--benchmark-suite",
+        choices=("representative", "legacy", "text"),
+        default="representative",
+        help="Run the current four-dataset suite or the original five-dataset suite standardized to 256 tokens.",
+    )
     parser.add_argument(
         "--baseline-results",
         type=Path,
         help="Completed baseline JSON used to calculate speedup without rerunning autoregressive decoding.",
+    )
+    parser.add_argument(
+        "--check-target-parity",
+        action="store_true",
+        help="Generate greedy target references in memory and compare every speculative output token.",
     )
     parser.add_argument("--input-data", type=Path, help="Local ShareGPT-style multimodal JSONL.")
     parser.add_argument("--media-dir", type=Path, help="Root for relative image paths in --input-data.")
@@ -775,7 +981,7 @@ def main() -> None:
         "--max-new-tokens",
         type=int,
         default=FIXED_NEW_TOKENS,
-        help="Generation length for --input-data (official benchmarks always use 512).",
+        help="Generation length for --input-data; official suites use their YAML value.",
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -790,8 +996,18 @@ def main() -> None:
         parser.error("--max-new-tokens must be positive")
     if args.num_prompts <= 0:
         parser.error("--num-prompts must be positive")
+    if not math.isfinite(args.visual_gate_multiplier) or args.visual_gate_multiplier < 0:
+        parser.error("--visual-gate-multiplier must be finite and non-negative")
+    if args.mode != "dflash" and args.visual_gate_multiplier != 1.0:
+        parser.error("--visual-gate-multiplier is only valid in dflash mode")
+    if args.mode != "dflash" and args.draft_image_context_mode != "keep":
+        parser.error("--draft-image-context-mode is only valid in dflash mode")
+    if args.benchmark_suite == "text" and args.draft_image_context_mode != "keep":
+        parser.error("--draft-image-context-mode zero/shuffle requires a multimodal benchmark suite")
     if args.mode == "baseline" and args.baseline_results is not None:
         parser.error("--baseline-results is only valid for dflash and vispec modes")
+    if args.check_target_parity and args.mode != "dflash":
+        parser.error("--check-target-parity is only valid in dflash mode")
 
     if args.input_data is not None:
         benchmark_inputs = [
@@ -808,12 +1024,24 @@ def main() -> None:
         ]
     else:
         benchmark_inputs = []
-        for spec in _load_benchmark_specs():
+        suites = {
+            "representative": (BENCHMARK_CONFIG, REPRESENTATIVE_BENCHMARKS, FIXED_NEW_TOKENS),
+            "legacy": (LEGACY_BENCHMARK_CONFIG, LEGACY_BENCHMARKS, LEGACY_NEW_TOKENS),
+            "text": (TEXT_BENCHMARK_CONFIG, TEXT_BENCHMARKS, LEGACY_NEW_TOKENS),
+        }
+        benchmark_config, expected_benchmarks, expected_max_new_tokens = suites[args.benchmark_suite]
+        if args.only is not None and args.only not in expected_benchmarks:
+            parser.error(f"--only {args.only} is not part of the {args.benchmark_suite} benchmark suite")
+        for spec in _load_benchmark_specs(benchmark_config, expected_benchmarks, expected_max_new_tokens):
             if args.only is not None and spec["name"] != args.only:
                 continue
             logger.info("[setup] loading benchmark=%s prompts=%d", spec["name"], args.num_prompts)
-            prompts = _load_official_prompts(spec, args.num_prompts)
-            benchmark_inputs.append((spec["name"], FIXED_NEW_TOKENS, prompts))
+            prompts = (
+                _load_text_prompts(spec, args.num_prompts)
+                if args.benchmark_suite == "text"
+                else _load_official_prompts(spec, args.num_prompts)
+            )
+            benchmark_inputs.append((spec["name"], spec["max_new_tokens"], prompts))
 
     benchmark_limits = {name: max_new_tokens for name, max_new_tokens, _ in benchmark_inputs}
     baseline_throughputs = (
@@ -853,11 +1081,28 @@ def main() -> None:
                 benchmark_name=name,
             )
         elif args.mode == "dflash":
-            draft = _load_dflash(args.draft, target, device)
+            draft = _load_dflash(
+                args.draft,
+                target,
+                device,
+                visual_gate_multiplier=args.visual_gate_multiplier,
+            )
             if args.block_size is not None:
                 draft.block_size = args.block_size
             if args.draft_layers is not None:
                 draft.layers = draft.layers[: args.draft_layers]
+            reference_outputs = None
+            if args.check_target_parity:
+                reference_result = _baseline(
+                    target,
+                    processor,
+                    prompts,
+                    max_new_tokens,
+                    device,
+                    fixed_output_length=args.fixed_output_length,
+                    benchmark_name=name,
+                )
+                reference_outputs = reference_result["_reference_outputs"]
             result = _dflash(
                 target,
                 processor,
@@ -865,10 +1110,11 @@ def main() -> None:
                 prompts,
                 max_new_tokens,
                 device,
-                None,
+                reference_outputs=reference_outputs,
                 fixed_output_length=args.fixed_output_length,
                 verification_mode=args.verification_mode,
                 benchmark_name=name,
+                draft_image_context_mode=args.draft_image_context_mode,
             )
         else:
             result = _vispec(
@@ -881,6 +1127,7 @@ def main() -> None:
                 None,
                 fixed_output_length=args.fixed_output_length,
                 benchmark_name=name,
+                proposal_mode=args.vispec_proposal_mode,
             )
         if args.mode == "baseline":
             result.pop("_reference_outputs", None)
@@ -894,19 +1141,27 @@ def main() -> None:
             "num_prompts": len(prompts),
             "max_new_tokens": max_new_tokens,
             "fixed_output_length": args.fixed_output_length,
+            "benchmark_suite": args.benchmark_suite if args.input_data is None else None,
             "input_data": str(args.input_data) if args.input_data is not None else None,
             "media_dir": str(args.media_dir) if args.media_dir is not None else None,
             "input_start": args.input_start if args.input_data is not None else None,
             "baseline_results": str(args.baseline_results) if args.baseline_results is not None else None,
+            "target_parity_checked": args.check_target_parity if args.mode == "dflash" else None,
             "block_size": args.block_size if args.mode == "dflash" else None,
             "draft_layers": args.draft_layers if args.mode == "dflash" else None,
+            "visual_gate_multiplier": args.visual_gate_multiplier if args.mode == "dflash" else None,
+            "draft_image_context_mode": args.draft_image_context_mode if args.mode == "dflash" else None,
             "attn_implementation": args.attn_implementation,
             "verification_mode": args.verification_mode
             if args.mode == "dflash"
-            else ("tree" if args.mode == "vispec" else None),
+            else (args.vispec_proposal_mode if args.mode == "vispec" else None),
             "vispec_depth": VISPEC_DEPTH if args.mode == "vispec" else None,
-            "vispec_top_k": VISPEC_TOP_K if args.mode == "vispec" else None,
-            "vispec_total_token": VISPEC_TOTAL_TOKEN if args.mode == "vispec" else None,
+            "vispec_top_k": (VISPEC_TOP_K if args.vispec_proposal_mode == "tree" else 1)
+            if args.mode == "vispec"
+            else None,
+            "vispec_total_token": (VISPEC_TOTAL_TOKEN if args.vispec_proposal_mode == "tree" else VISPEC_DEPTH + 2)
+            if args.mode == "vispec"
+            else None,
             **result,
         }
         args.output.write_text(json.dumps(results, indent=2) + "\n")

@@ -1,0 +1,547 @@
+{
+  "gqa": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_matched_stage2_checkpoints/epoch_4_step_200/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 10,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 10,
+    "output_tokens": 2560,
+    "wall_clock_s": 43.935033665038645,
+    "tok_s": 58.26785110755755,
+    "accept_length": 0.8181818181818182,
+    "emitted_tokens_per_step": 1.8181818181818183,
+    "acceptance_rate": 0.11862835959221502,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 149,
+        "accepted_tokens": 183,
+        "draft_tokens": 1043,
+        "accept_length": 1.2281879194630871,
+        "emitted_tokens_per_step": 2.228187919463087,
+        "acceptance_rate": 0.17545541706615533
+      },
+      "33-64": {
+        "verify_steps": 139,
+        "accepted_tokens": 175,
+        "draft_tokens": 973,
+        "accept_length": 1.2589928057553956,
+        "emitted_tokens_per_step": 2.258992805755396,
+        "acceptance_rate": 0.17985611510791366
+      },
+      "65-128": {
+        "verify_steps": 381,
+        "accepted_tokens": 254,
+        "draft_tokens": 2667,
+        "accept_length": 0.6666666666666666,
+        "emitted_tokens_per_step": 1.6666666666666665,
+        "acceptance_rate": 0.09523809523809523
+      },
+      "129-256": {
+        "verify_steps": 739,
+        "accepted_tokens": 540,
+        "draft_tokens": 5028,
+        "accept_length": 0.7307171853856563,
+        "emitted_tokens_per_step": 1.7307171853856564,
+        "acceptance_rate": 0.10739856801909307
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 1402,
+        "accepted": 788,
+        "acceptance_rate": 0.5620542082738944
+      },
+      "2": {
+        "opportunities": 1396,
+        "accepted": 227,
+        "acceptance_rate": 0.16260744985673353
+      },
+      "3": {
+        "opportunities": 1393,
+        "accepted": 92,
+        "acceptance_rate": 0.06604450825556353
+      },
+      "4": {
+        "opportunities": 1388,
+        "accepted": 33,
+        "acceptance_rate": 0.02377521613832853
+      },
+      "5": {
+        "opportunities": 1383,
+        "accepted": 9,
+        "acceptance_rate": 0.006507592190889371
+      },
+      "6": {
+        "opportunities": 1376,
+        "accepted": 2,
+        "acceptance_rate": 0.0014534883720930232
+      },
+      "7": {
+        "opportunities": 1373,
+        "accepted": 1,
+        "acceptance_rate": 0.0007283321194464676
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 1.3757194366455077,
+    "draft_s": 8.635538880348205,
+    "target_verify_s": 32.525291599273686,
+    "unattributed_s": 1.3984837487712412
+  },
+  "textvqa": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_matched_stage2_checkpoints/epoch_4_step_200/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 10,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 10,
+    "output_tokens": 2560,
+    "wall_clock_s": 43.40168044203892,
+    "tok_s": 58.98389126703907,
+    "accept_length": 0.9968798751950078,
+    "emitted_tokens_per_step": 1.9968798751950079,
+    "acceptance_rate": 0.14447207777526566,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 147,
+        "accepted_tokens": 184,
+        "draft_tokens": 1029,
+        "accept_length": 1.251700680272109,
+        "emitted_tokens_per_step": 2.251700680272109,
+        "acceptance_rate": 0.17881438289601556
+      },
+      "33-64": {
+        "verify_steps": 146,
+        "accepted_tokens": 168,
+        "draft_tokens": 1022,
+        "accept_length": 1.1506849315068493,
+        "emitted_tokens_per_step": 2.1506849315068495,
+        "acceptance_rate": 0.1643835616438356
+      },
+      "65-128": {
+        "verify_steps": 333,
+        "accepted_tokens": 311,
+        "draft_tokens": 2331,
+        "accept_length": 0.933933933933934,
+        "emitted_tokens_per_step": 1.9339339339339339,
+        "acceptance_rate": 0.13341913341913342
+      },
+      "129-256": {
+        "verify_steps": 656,
+        "accepted_tokens": 615,
+        "draft_tokens": 4464,
+        "accept_length": 0.9375,
+        "emitted_tokens_per_step": 1.9375,
+        "acceptance_rate": 0.13776881720430106
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 1281,
+        "accepted": 706,
+        "acceptance_rate": 0.5511319281811085
+      },
+      "2": {
+        "opportunities": 1275,
+        "accepted": 336,
+        "acceptance_rate": 0.2635294117647059
+      },
+      "3": {
+        "opportunities": 1269,
+        "accepted": 141,
+        "acceptance_rate": 0.1111111111111111
+      },
+      "4": {
+        "opportunities": 1264,
+        "accepted": 66,
+        "acceptance_rate": 0.05221518987341772
+      },
+      "5": {
+        "opportunities": 1257,
+        "accepted": 21,
+        "acceptance_rate": 0.016706443914081145
+      },
+      "6": {
+        "opportunities": 1253,
+        "accepted": 7,
+        "acceptance_rate": 0.00558659217877095
+      },
+      "7": {
+        "opportunities": 1247,
+        "accepted": 1,
+        "acceptance_rate": 0.0008019246190858059
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 1.552521957397461,
+    "draft_s": 8.583324410438538,
+    "target_verify_s": 31.72986787223816,
+    "unattributed_s": 1.5359662019647686
+  },
+  "coco_caption": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_matched_stage2_checkpoints/epoch_4_step_200/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 10,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 10,
+    "output_tokens": 2560,
+    "wall_clock_s": 42.3626542580314,
+    "tok_s": 60.430585496532196,
+    "accept_length": 1.098360655737705,
+    "emitted_tokens_per_step": 2.098360655737705,
+    "acceptance_rate": 0.15914489311163896,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 145,
+        "accepted_tokens": 188,
+        "draft_tokens": 1015,
+        "accept_length": 1.296551724137931,
+        "emitted_tokens_per_step": 2.296551724137931,
+        "acceptance_rate": 0.1852216748768473
+      },
+      "33-64": {
+        "verify_steps": 139,
+        "accepted_tokens": 174,
+        "draft_tokens": 973,
+        "accept_length": 1.2517985611510791,
+        "emitted_tokens_per_step": 2.2517985611510793,
+        "acceptance_rate": 0.17882836587872558
+      },
+      "65-128": {
+        "verify_steps": 302,
+        "accepted_tokens": 344,
+        "draft_tokens": 2114,
+        "accept_length": 1.1390728476821192,
+        "emitted_tokens_per_step": 2.1390728476821192,
+        "acceptance_rate": 0.16272469252601704
+      },
+      "129-256": {
+        "verify_steps": 634,
+        "accepted_tokens": 634,
+        "draft_tokens": 4318,
+        "accept_length": 1.0,
+        "emitted_tokens_per_step": 2.0,
+        "acceptance_rate": 0.14682723483094026
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 1216,
+        "accepted": 805,
+        "acceptance_rate": 0.6620065789473685
+      },
+      "2": {
+        "opportunities": 1212,
+        "accepted": 351,
+        "acceptance_rate": 0.2896039603960396
+      },
+      "3": {
+        "opportunities": 1207,
+        "accepted": 111,
+        "acceptance_rate": 0.09196354598177299
+      },
+      "4": {
+        "opportunities": 1203,
+        "accepted": 47,
+        "acceptance_rate": 0.03906899418121363
+      },
+      "5": {
+        "opportunities": 1198,
+        "accepted": 19,
+        "acceptance_rate": 0.015859766277128547
+      },
+      "6": {
+        "opportunities": 1194,
+        "accepted": 5,
+        "acceptance_rate": 0.0041876046901172526
+      },
+      "7": {
+        "opportunities": 1190,
+        "accepted": 2,
+        "acceptance_rate": 0.0016806722689075631
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 0.9347352294921876,
+    "draft_s": 8.516469856739045,
+    "target_verify_s": 31.440365734100343,
+    "unattributed_s": 1.4710834376998214
+  },
+  "charxiv_reasoning": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_matched_stage2_checkpoints/epoch_4_step_200/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 10,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 10,
+    "output_tokens": 2560,
+    "wall_clock_s": 46.245126713998616,
+    "tok_s": 55.357184246293265,
+    "accept_length": 0.9984387197501952,
+    "emitted_tokens_per_step": 1.9984387197501952,
+    "acceptance_rate": 0.14491275776116022,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 189,
+        "accepted_tokens": 141,
+        "draft_tokens": 1323,
+        "accept_length": 0.746031746031746,
+        "emitted_tokens_per_step": 1.746031746031746,
+        "acceptance_rate": 0.10657596371882086
+      },
+      "33-64": {
+        "verify_steps": 165,
+        "accepted_tokens": 152,
+        "draft_tokens": 1155,
+        "accept_length": 0.9212121212121213,
+        "emitted_tokens_per_step": 1.9212121212121214,
+        "acceptance_rate": 0.1316017316017316
+      },
+      "65-128": {
+        "verify_steps": 355,
+        "accepted_tokens": 284,
+        "draft_tokens": 2485,
+        "accept_length": 0.8,
+        "emitted_tokens_per_step": 1.8,
+        "acceptance_rate": 0.11428571428571428
+      },
+      "129-256": {
+        "verify_steps": 572,
+        "accepted_tokens": 702,
+        "draft_tokens": 3863,
+        "accept_length": 1.2272727272727273,
+        "emitted_tokens_per_step": 2.2272727272727275,
+        "acceptance_rate": 0.18172404866683925
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 1273,
+        "accepted": 801,
+        "acceptance_rate": 0.629222309505106
+      },
+      "2": {
+        "opportunities": 1270,
+        "accepted": 404,
+        "acceptance_rate": 0.31811023622047246
+      },
+      "3": {
+        "opportunities": 1266,
+        "accepted": 53,
+        "acceptance_rate": 0.04186413902053712
+      },
+      "4": {
+        "opportunities": 1261,
+        "accepted": 17,
+        "acceptance_rate": 0.013481363996827915
+      },
+      "5": {
+        "opportunities": 1256,
+        "accepted": 4,
+        "acceptance_rate": 0.0031847133757961785
+      },
+      "6": {
+        "opportunities": 1254,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      },
+      "7": {
+        "opportunities": 1246,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 1.7415276260375974,
+    "draft_s": 9.083250367641448,
+    "target_verify_s": 33.75653935432434,
+    "unattributed_s": 1.6638093659952347
+  },
+  "mmmu_pro": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_matched_stage2_checkpoints/epoch_4_step_200/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 10,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 10,
+    "output_tokens": 2560,
+    "wall_clock_s": 46.6835786558222,
+    "tok_s": 54.837269843294806,
+    "accept_length": 0.9147344801795063,
+    "emitted_tokens_per_step": 1.9147344801795063,
+    "acceptance_rate": 0.13243096913914457,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 186,
+        "accepted_tokens": 141,
+        "draft_tokens": 1302,
+        "accept_length": 0.7580645161290323,
+        "emitted_tokens_per_step": 1.7580645161290323,
+        "acceptance_rate": 0.10829493087557604
+      },
+      "33-64": {
+        "verify_steps": 178,
+        "accepted_tokens": 140,
+        "draft_tokens": 1246,
+        "accept_length": 0.7865168539325843,
+        "emitted_tokens_per_step": 1.7865168539325844,
+        "acceptance_rate": 0.11235955056179775
+      },
+      "65-128": {
+        "verify_steps": 340,
+        "accepted_tokens": 301,
+        "draft_tokens": 2380,
+        "accept_length": 0.8852941176470588,
+        "emitted_tokens_per_step": 1.8852941176470588,
+        "acceptance_rate": 0.1264705882352941
+      },
+      "129-256": {
+        "verify_steps": 633,
+        "accepted_tokens": 641,
+        "draft_tokens": 4307,
+        "accept_length": 1.0126382306477093,
+        "emitted_tokens_per_step": 2.0126382306477093,
+        "acceptance_rate": 0.1488274901323427
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 1334,
+        "accepted": 739,
+        "acceptance_rate": 0.5539730134932533
+      },
+      "2": {
+        "opportunities": 1329,
+        "accepted": 368,
+        "acceptance_rate": 0.2768999247554552
+      },
+      "3": {
+        "opportunities": 1322,
+        "accepted": 87,
+        "acceptance_rate": 0.06580937972768533
+      },
+      "4": {
+        "opportunities": 1319,
+        "accepted": 25,
+        "acceptance_rate": 0.018953752843062926
+      },
+      "5": {
+        "opportunities": 1315,
+        "accepted": 4,
+        "acceptance_rate": 0.003041825095057034
+      },
+      "6": {
+        "opportunities": 1309,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      },
+      "7": {
+        "opportunities": 1307,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 1.9648851547241213,
+    "draft_s": 9.237547716140748,
+    "target_verify_s": 33.57036235046386,
+    "unattributed_s": 1.9107834344934744
+  }
+}

@@ -21,10 +21,12 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
@@ -36,6 +38,34 @@ _VOCAB = 64
 _HIDDEN = 32
 _MASK_ID = _VOCAB - 1
 _TARGET_LAYER_IDS = [1, 3, 5]
+
+
+def test_hard_mrope_full_example_matches_original_full_training() -> None:
+    """The full MRoPE run changes architecture and output ownership only."""
+    examples_dir = Path(__file__).parents[4] / "examples/speculative/dflash"
+    baseline = yaml.safe_load((examples_dir / "qwen2_5_vl_dflash.yaml").read_text())
+    hard_mrope = yaml.safe_load((examples_dir / "qwen2_5_vl_dflash_hard_mrope_full.yaml").read_text())
+
+    assert "draft_init_from" not in hard_mrope["recipe_args"]
+    assert "max_steps" not in hard_mrope["recipe_args"]
+    assert hard_mrope["recipe_args"]["training_stage"] == "joint"
+    assert hard_mrope["recipe_args"]["spatial_rope_enabled"] is True
+    assert hard_mrope["recipe_args"]["spatial_rope_mode"] == "replace"
+    assert hard_mrope["recipe_args"]["spatial_rope_sections"] == [16, 24, 24]
+
+    architecture_fields = {"training_stage", "spatial_rope_enabled", "spatial_rope_mode", "spatial_rope_sections"}
+    output_fields = {"output_dir"}
+    shared_hard_mrope_args = {
+        key: value for key, value in hard_mrope["recipe_args"].items() if key not in architecture_fields | output_fields
+    }
+    assert shared_hard_mrope_args == {
+        key: value for key, value in baseline["recipe_args"].items() if key not in output_fields
+    }
+    assert hard_mrope["dataset"] == baseline["dataset"]
+    assert hard_mrope["optimizer"] == baseline["optimizer"]
+    assert hard_mrope["compile"] == baseline["compile"]
+    assert hard_mrope["checkpoint"]["model_save_format"] == "safetensors"
+    assert hard_mrope["checkpoint"]["save_consolidated"] == "final"
 
 
 def _dflash_draft():
@@ -350,7 +380,7 @@ def test_run_train_validation_loop_finalizes_before_close():
     obj._resume_epoch = 0
     obj.dist_env = SimpleNamespace(is_main=False)
     obj.total_optim_steps = 1
-    obj.runtime = SimpleNamespace(global_step=1)
+    obj.runtime = SimpleNamespace(global_step=0)
     obj.train_dataloader = []
     obj._make_progress_bar = lambda **kwargs: FakePbar()
     obj._run_eval = lambda: None
@@ -384,8 +414,9 @@ def test_run_train_validation_loop_resumes_at_next_batch():
     ]
     obj.device = torch.device("cpu")
     obj.target_wrapper = SimpleNamespace(
-        generate_batch=lambda **batch: processed_batches.append(batch["input_ids"].item())
-        or SimpleNamespace(input_ids=batch["input_ids"])
+        generate_batch=lambda **batch: (
+            processed_batches.append(batch["input_ids"].item()) or SimpleNamespace(input_ids=batch["input_ids"])
+        )
     )
     parameter = next(obj.trainer_module.parameters())
     obj._run_trainer_step = lambda batch: SimpleNamespace(
@@ -476,6 +507,8 @@ def _eval_self(trainer, num_batches):
                 position_ids=None,
                 seq_lens=None,
                 doc_remaining=None,
+                image_mask=None,
+                multimodal_position_ids=None,
             )
         ),
     )

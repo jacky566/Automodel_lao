@@ -127,6 +127,60 @@ model identities or vision-module paths in generic DFlash code.
   rewritten vision layer is introduced.
 - A short training test followed by the complete A/B benchmark matrix above.
 
+## Two-stage training workflow
+
+The implemented two-query workflow warm-starts the original 14,574-step DFlash
+checkpoint and gives each training stage one complete pass over the 68,000-row
+dataset. With a micro-batch size of 28 and one GPU, this is normally 2,429
+optimizer steps per stage (4,858 total):
+
+| Stage | Trainable parameters | Epochs | Expected steps | Learning rates |
+|---|---|---:|---:|---|
+| 1 | Per-layer visual resampler, cross-attention, and gate | 1 | 2,429 | visual `4e-4` |
+| 2 | DFlash backbone plus all visual modules | 1 | 2,429 | backbone `1e-4`, visual `3e-4` |
+
+Each of the three draft layers compresses image-token features from its paired
+target layer into two 256-dimensional queries using four attention heads. This
+keeps the visual branch to roughly 9.2 million parameters instead of performing
+full-width 3,584-dimensional cross-attention. The resulting contexts are built
+once in inference prefill and passed explicitly through subsequent draft
+rounds; they are not stored as mutable model state, so prompts cannot reuse
+stale context.
+
+The cached context pools all image tokens in one sample. Therefore every image
+must occur before the first supervised assistant token. Training rejects later
+images instead of allowing future-turn visual leakage. The current 68,000-row
+ViSpec training set satisfies this rule (all rows were audited), but packed or
+multi-turn datasets must be checked before use.
+
+The local Transformers evaluator implements the visual adaptor. The current
+vLLM DFlash runtime does not; `serve_vllm.py` rejects these checkpoints so it
+cannot silently serve only the text backbone.
+
+Run both stages in sequence:
+
+```bash
+DFLASH_NPROC=1 bash scripts/train_qwen2_5_vl_dflash_visual.sh
+```
+
+The stage configurations are
+`qwen2_5_vl_dflash_visual_stage1.yaml` and
+`qwen2_5_vl_dflash_visual_stage2.yaml`. The script resolves relative checkpoint
+and output paths from the repository root. Adjust the `/data/models` and dataset
+paths before starting if the server mount differs.
+
+Stage 1 saves a resumable checkpoint every 400 optimizer steps, and Stage 2
+saves one every 1,000 steps. Both stages always save a final consolidated
+safetensors checkpoint; retention keeps the two most recent checkpoints in each
+stage directory. The sequential launcher validates the final Stage 1
+safetensors and passes its resolved path directly into Stage 2.
+
+Before the full run, both stages were exercised for one optimizer step with a
+`micro_batch_size` of 28 and `seq_length` of 3,072 on one NVIDIA B200. The final
+configs use 256 anchors in both stages, matching the original DFlash training
+objective. Stage transitions, consolidated checkpoint reload, `torch.compile`,
+and one cached-visual ScienceQA inference sample were also verified.
+
 ## Relevant current files
 
 - `examples/speculative/dflash/qwen2_5_vl_dflash.yaml`
@@ -135,3 +189,128 @@ model identities or vision-module paths in generic DFlash code.
 - `nemo_automodel/components/speculative/dflash/domino_core.py`
 - `nemo_automodel/components/speculative/dflash/target.py`
 - `tools/transformers_vlm_spec_bench.py`
+
+## Target-layer routing smoke experiment (2026-08-19)
+
+This minimum-cost diagnostic tests whether the original shared projection of
+target layers 1, 13, and 25 hides useful layer-specific multimodal information.
+It warm-starts the matched 400-step DFlash checkpoint and adds one scalar gate
+per draft layer. Draft layer `i` receives
+
+```text
+shared_context + tanh(gate_i) * (paired_target_layer_i - shared_context)
+```
+
+after applying the corresponding slice of the existing `fc.weight`. All
+backbone weights remain frozen, the gates start at zero, and the zero-gate path
+is bitwise identical to the original DFlash output. This changes neither the
+context sequence length nor the draft KV-cache size.
+
+Training used the 1,280-row matched VLM dataset, 256 anchors, block size 8,
+micro-batch size 28, BF16, and 100 optimizer steps. Only three scalars were
+trained with AdamW, peak LR `5e-3`, 5% warmup, and cosine decay. The run took
+3 minutes 31 seconds on one NVIDIA B200. Final gate strengths were
+`[-0.0124, -0.0225, +0.0302]` for target layers `[1, 13, 25]`.
+
+The evaluation reused the same first 10 samples, fixed 256 output tokens,
+greedy block verification, block size 8, and SDPA target backend as the matched
+DFlash baseline:
+
+| Benchmark | Variant | Accepted draft tokens / verify step | Emitted tokens / verify step | Acceptance rate | Tokens/s |
+|---|---|---:|---:|---:|---:|
+| GQA | Matched DFlash | 0.9076 | 1.9076 | 13.16% | 60.46 |
+| GQA | + layer routing | 0.9033 | 1.9033 | 13.10% | 68.00 |
+| TextVQA | Matched DFlash | 1.0205 | 2.0205 | 14.80% | 64.45 |
+| TextVQA | + layer routing | 1.0221 | 2.0221 | 14.82% | 67.80 |
+
+The acceptance changes are -0.47% on GQA and +0.16% on TextVQA, so this does
+not provide evidence of a useful improvement. The throughput values came from
+one timing run per checkpoint and should not be interpreted as a routing gain:
+the routing adds computation, acceptance is effectively unchanged, and the
+target-verification timing differed between runs. The result instead suggests
+that simple per-draft-layer selection of already-captured target features is
+not the main VLM bottleneck. The next targeted diagnostic should preserve and
+route Qwen2.5-VL's multimodal position structure (MRoPE), rather than adding
+more visual pooling capacity or extending this scalar-routing run.
+
+Artifacts:
+
+- Config: `qwen2_5_vl_dflash_layer_routing_smoke.yaml`
+- Checkpoint: `dflash_layer_routing_smoke_checkpoints/epoch_2_step_100/model/consolidated`
+- Results: `benchmark_results/dflash_layer_routing_step100_gqa_10x256.json`
+  and `benchmark_results/dflash_layer_routing_step100_textvqa_10x256.json`
+
+## MRoPE gate and direct-replacement experiments (2026-08-26)
+
+The next diagnostic preserves the target VLM's temporal, height, and width
+positions in draft attention. Each draft layer owns one zero-initialized scalar
+that interpolates its rotated query/key tensors between the existing one-axis
+RoPE path and the target-compatible MRoPE path. Gate zero is bitwise equivalent
+to matched DFlash, and the change does not add tokens or increase KV-cache
+length.
+
+The target wrapper computes and returns the same three-axis positions used by
+the frozen Qwen2.5-VL target. Training constructs each sampled draft block's
+positions from its anchor's three-axis position. Inference extends the final
+prompt position equally along all three axes for generated text tokens. The
+MRoPE channel sections are `[16, 24, 24]`, matching the target's 128-dimensional
+attention head.
+
+CPU coverage includes zero-gate exact equivalence, text-position equivalence,
+numerical parity with Transformers' Qwen2.5-VL MRoPE reference, target position
+capture, block-position construction, gate-only gradients, and checkpoint
+migration. The focused suite passes 114 tests. A real one-step B200 smoke run
+also completed training, saved consolidated safetensors, updated all three gates
+to finite nonzero values, and generated one fixed-length 256-token GQA sample
+from the exported checkpoint.
+
+The complete diagnostic trains only three gates for 100 optimizer steps on the
+1,280-row matched dataset, saving consolidated checkpoints at steps 50 and 100.
+The launcher then evaluates all five legacy benchmarks with ten samples and 256
+fixed output tokens:
+
+```bash
+bash scripts/run_qwen2_5_vl_dflash_spatial_rope_100step.sh
+```
+
+The gated run completed without an acceptance gain. Its final strengths were
+`[-0.00365, -0.00190, -0.00294]`, and its five-task mean accepted draft length
+was `0.9012`, compared with `0.9064` for matched DFlash. The near-zero gates
+show that a frozen one-axis backbone does not benefit from a small local MRoPE
+interpolation, but this result alone does not test whether the attention
+backbone can co-adapt to direct MRoPE.
+
+A controlled direct-replacement experiment therefore removed the gate,
+replaced one-axis RoPE with MRoPE in every draft layer, and trained the complete
+draft backbone. Both direct-MRoPE and matched DFlash started from the same
+original `epoch_6_step_14574` checkpoint and used the same 1,280 examples, 400
+steps, peak learning rate `3e-5`, 256 anchors, block size 8, and cosine schedule.
+Checkpoints at steps 200 and 400 were each evaluated on the same first ten
+samples from all five legacy benchmarks with 256 fixed output tokens.
+
+| Benchmark | Matched DFlash | Hard MRoPE step 200 | Hard MRoPE step 400 | Step-400 change |
+|---|---:|---:|---:|---:|
+| GQA | 0.9121 | 0.9753 | 0.9799 | +0.0678 |
+| TextVQA | 1.0292 | 1.0253 | 1.0221 | -0.0071 |
+| COCO Caption | 1.0086 | 1.0205 | 1.0205 | +0.0119 |
+| CharXiv Reasoning | 0.7273 | 0.7204 | 0.7181 | -0.0092 |
+| MMMU-Pro | 0.8548 | 0.8810 | 0.8837 | +0.0290 |
+| **Mean** | **0.9064** | **0.9245** | **0.9249** | **+0.0185** |
+
+Direct MRoPE is materially different from the failed scalar gate: it improves
+GQA and MMMU-Pro after full-backbone adaptation. However, the mean gain remains
+below the predeclared `+0.03` threshold, TextVQA and CharXiv regress slightly,
+and another 200 steps add only `+0.00037` mean acceptance. This is evidence of a
+task-specific spatial benefit, not a general replacement for matched DFlash.
+Do not spend the original 14,574-step training budget on a random-initialized
+MRoPE draft yet. The next experiment should test a region-aware,
+token-conditioned path on the GQA/OCR split, where the spatial signal can be
+isolated more directly.
+
+Artifacts:
+
+- Config: `qwen2_5_vl_dflash_hard_mrope_400step.yaml`
+- Checkpoints: `dflash_hard_mrope_400step_checkpoints/epoch_4_step_200/model/consolidated`
+  and `dflash_hard_mrope_400step_checkpoints/epoch_8_step_400/model/consolidated`
+- Results: `benchmark_results/dflash_hard_mrope_step200_legacy5_10x256.json`
+  and `benchmark_results/dflash_hard_mrope_step400_legacy5_10x256.json`

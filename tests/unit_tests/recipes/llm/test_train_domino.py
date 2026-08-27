@@ -122,7 +122,12 @@ def _domino_draft(shift_label=True, pure_prefix=1):
 
 
 def _recipe():
-    return TrainDominoRecipe.__new__(TrainDominoRecipe)
+    recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
+    recipe.spatial_rope_enabled = False
+    recipe.spatial_rope_sections = []
+    recipe.layer_routing_enabled = False
+    recipe.visual_num_query_tokens = 0
+    return recipe
 
 
 def test_build_dflash_config_adds_domino_fields():
@@ -202,10 +207,12 @@ def test_run_trainer_step_injects_lambda_base():
         position_ids=None,
         seq_lens=None,
         doc_remaining=None,
+        multimodal_position_ids=torch.zeros(3, 1, 4, dtype=torch.long),
     )
     out = recipe._run_trainer_step(target_batch)
     # global_step 50 / (100 * 1.0) -> lambda_base 0.5.
     assert seen["lambda_base"] == 0.5
+    assert seen["multimodal_position_ids"] is target_batch.multimodal_position_ids
     assert recipe._last_domino_metrics is out
 
 

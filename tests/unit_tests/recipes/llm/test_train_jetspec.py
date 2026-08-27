@@ -83,6 +83,10 @@ def _jetspec_recipe():
     recipe.draft_model = _draft()
     recipe.mask_token_id = MASK_ID
     recipe.block_size = BLOCK_SIZE
+    recipe.spatial_rope_enabled = False
+    recipe.spatial_rope_sections = []
+    recipe.layer_routing_enabled = False
+    recipe.visual_num_query_tokens = 0
     return recipe
 
 

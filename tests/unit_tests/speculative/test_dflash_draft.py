@@ -18,13 +18,17 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
 import torch
 import torch.nn as nn
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
+    _merge_multiaxis_rotary_embeddings,
     _prepend_text_position_ids,
+    apply_rotary_pos_emb,
     build_target_layer_ids,
     extract_context_feature,
 )
@@ -163,6 +167,237 @@ def test_plain_dflash_sampling_keeps_parallel_suffix_logits() -> None:
         actual = draft._sample_draft_tokens(target, draft_hidden, block_ids)
 
     torch.testing.assert_close(actual, expected)
+
+
+def _routing_cfg() -> Qwen3Config:
+    config = _draft_cfg()
+    config.dflash_config = {
+        "mask_token_id": 63,
+        "target_layer_ids": [1, 5],
+        "layer_routing_enabled": True,
+    }
+    return config
+
+
+def test_zero_layer_routing_gates_preserve_plain_dflash_output() -> None:
+    """A routing warm start must be numerically identical before training."""
+    torch.manual_seed(23)
+    plain_config = deepcopy(_routing_cfg())
+    plain_config.dflash_config["layer_routing_enabled"] = False
+    plain = Qwen3DFlashDraftModel(plain_config).eval()
+    routed = Qwen3DFlashDraftModel(_routing_cfg()).eval()
+    missing, unexpected = routed.load_state_dict(plain.state_dict(), strict=False)
+    assert missing == ["layer_route_gates"]
+    assert unexpected == []
+
+    batch_size, context_length, query_length = 2, 7, 8
+    target_hidden = torch.randn(batch_size, context_length, 64)
+    noise = torch.randn(batch_size, query_length, 32)
+    position_ids = torch.arange(context_length + query_length).unsqueeze(0).expand(batch_size, -1)
+
+    with torch.inference_mode():
+        plain_output = plain(
+            position_ids=position_ids,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+        routed_output = routed(
+            position_ids=position_ids,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+
+    torch.testing.assert_close(routed_output, plain_output, rtol=0, atol=0)
+
+
+def test_layer_routing_stage_trains_only_gates() -> None:
+    """The diagnostic stage changes only the three-way context mixture."""
+    model = Qwen3DFlashDraftModel(_routing_cfg())
+    model.set_layer_routing_training_stage("layer_routing")
+    target_hidden = torch.randn(2, 7, 64)
+    noise = torch.randn(2, 8, 32)
+    position_ids = torch.arange(15).unsqueeze(0).expand(2, -1)
+
+    output = model(position_ids=position_ids, noise_embedding=noise, target_hidden=target_hidden)
+    output.square().mean().backward()
+
+    assert model.layer_route_gates.requires_grad
+    assert model.layer_route_gates.grad is not None
+    assert torch.isfinite(model.layer_route_gates.grad).all()
+    assert torch.count_nonzero(model.layer_route_gates.grad) > 0
+    assert all(parameter.grad is None for name, parameter in model.named_parameters() if name != "layer_route_gates")
+
+
+def test_layer_routing_requires_one_target_layer_per_draft_layer() -> None:
+    config = _draft_cfg()
+    config.dflash_config["layer_routing_enabled"] = True
+
+    with pytest.raises(ValueError, match="one captured target layer per draft layer"):
+        Qwen3DFlashDraftModel(config)
+
+
+def _spatial_rope_cfg() -> Qwen3Config:
+    config = _draft_cfg()
+    config.dflash_config = {
+        "mask_token_id": 63,
+        "target_layer_ids": [1, 3, 5],
+        "spatial_rope_enabled": True,
+        "spatial_rope_sections": [1, 1, 2],
+    }
+    return config
+
+
+def _hard_spatial_rope_cfg() -> Qwen3Config:
+    config = _spatial_rope_cfg()
+    config.dflash_config["spatial_rope_mode"] = "replace"
+    return config
+
+
+def test_equal_multimodal_axes_match_text_rotary_embeddings() -> None:
+    model = Qwen3DFlashDraftModel(_spatial_rope_cfg()).eval()
+    hidden_states = torch.randn(2, 4, 32)
+    position_ids = torch.arange(9).unsqueeze(0).expand(2, -1)
+
+    expected = model.rotary_emb(hidden_states, position_ids)
+    actual = _merge_multiaxis_rotary_embeddings(
+        model.rotary_emb,
+        hidden_states,
+        position_ids.unsqueeze(0).expand(3, -1, -1),
+        model.spatial_rope_sections,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def test_multimodal_rotary_sections_match_qwen_vl_reference() -> None:
+    model = Qwen3DFlashDraftModel(_spatial_rope_cfg()).eval()
+    hidden_states = torch.randn(2, 4, 32)
+    position_ids = torch.randint(0, 16, (3, 2, 9))
+    merged_cos, merged_sin = _merge_multiaxis_rotary_embeddings(
+        model.rotary_emb,
+        hidden_states,
+        position_ids,
+        model.spatial_rope_sections,
+    )
+    flat_cos, flat_sin = model.rotary_emb(hidden_states, position_ids.flatten(0, 1))
+    axis_cos = flat_cos.reshape(3, 2, 9, 8)
+    axis_sin = flat_sin.reshape(3, 2, 9, 8)
+    query = torch.randn(2, 4, 9, 8)
+    key = torch.randn(2, 2, 9, 8)
+
+    actual = apply_rotary_pos_emb(query, key, merged_cos, merged_sin)
+    expected = apply_multimodal_rotary_pos_emb(
+        query,
+        key,
+        axis_cos,
+        axis_sin,
+        list(model.spatial_rope_sections),
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def test_zero_spatial_rope_gates_preserve_plain_dflash_output() -> None:
+    torch.manual_seed(29)
+    plain = Qwen3DFlashDraftModel(_draft_cfg()).eval()
+    spatial = Qwen3DFlashDraftModel(_spatial_rope_cfg()).eval()
+    missing, unexpected = spatial.load_state_dict(plain.state_dict(), strict=False)
+    assert missing == ["spatial_rope_gates"]
+    assert unexpected == []
+    target_hidden = torch.randn(2, 7, 96)
+    noise = torch.randn(2, 8, 32)
+    position_ids = torch.arange(15).unsqueeze(0).expand(2, -1)
+    multimodal_position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).clone()
+    multimodal_position_ids[1, :, 2:5] = torch.tensor([3, 4, 3])
+    multimodal_position_ids[2, :, 2:5] = torch.tensor([7, 7, 8])
+
+    with torch.inference_mode():
+        expected = plain(position_ids=position_ids, noise_embedding=noise, target_hidden=target_hidden)
+        actual = spatial(
+            position_ids=position_ids,
+            multimodal_position_ids=multimodal_position_ids,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_spatial_rope_stage_trains_only_gates() -> None:
+    model = Qwen3DFlashDraftModel(_spatial_rope_cfg())
+    model.set_spatial_rope_training_stage("spatial_rope")
+    position_ids = torch.arange(15).unsqueeze(0).expand(2, -1)
+    multimodal_position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).clone()
+    multimodal_position_ids[1, :, 1:6] += 2
+    multimodal_position_ids[2, :, 1:6] += 5
+
+    output = model(
+        position_ids=position_ids,
+        multimodal_position_ids=multimodal_position_ids,
+        noise_embedding=torch.randn(2, 8, 32),
+        target_hidden=torch.randn(2, 7, 96),
+    )
+    output.square().mean().backward()
+
+    assert model.spatial_rope_gates.grad is not None
+    assert torch.isfinite(model.spatial_rope_gates.grad).all()
+    assert torch.count_nonzero(model.spatial_rope_gates.grad) > 0
+    assert all(parameter.grad is None for name, parameter in model.named_parameters() if name != "spatial_rope_gates")
+
+
+def test_hard_spatial_rope_uses_no_gate_and_changes_spatial_output() -> None:
+    torch.manual_seed(31)
+    plain = Qwen3DFlashDraftModel(_draft_cfg()).eval()
+    spatial = Qwen3DFlashDraftModel(_hard_spatial_rope_cfg()).eval()
+    missing, unexpected = spatial.load_state_dict(plain.state_dict(), strict=False)
+    assert missing == []
+    assert unexpected == []
+    assert spatial.spatial_rope_gates is None
+    assert "spatial_rope_gates" not in spatial.state_dict()
+    target_hidden = torch.randn(2, 7, 96)
+    noise = torch.randn(2, 8, 32)
+    position_ids = torch.arange(15).unsqueeze(0).expand(2, -1)
+    multimodal_position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).clone()
+    multimodal_position_ids[1, :, 1:7] += 3
+    multimodal_position_ids[2, :, 1:7] += 7
+
+    with torch.inference_mode():
+        expected = plain(position_ids=position_ids, noise_embedding=noise, target_hidden=target_hidden)
+        actual = spatial(
+            position_ids=position_ids,
+            multimodal_position_ids=multimodal_position_ids,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+
+    assert not torch.equal(actual, expected)
+    assert torch.isfinite(actual).all()
+
+
+def test_hard_spatial_rope_joint_stage_trains_backbone() -> None:
+    model = Qwen3DFlashDraftModel(_hard_spatial_rope_cfg())
+    with pytest.raises(ValueError, match="requires training_stage='joint'"):
+        model.set_spatial_rope_training_stage("spatial_rope")
+    model.set_spatial_rope_training_stage("joint")
+    position_ids = torch.arange(15).unsqueeze(0).expand(2, -1)
+    multimodal_position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).clone()
+    multimodal_position_ids[1, :, 1:6] += 2
+    multimodal_position_ids[2, :, 1:6] += 5
+
+    output = model(
+        position_ids=position_ids,
+        multimodal_position_ids=multimodal_position_ids,
+        noise_embedding=torch.randn(2, 8, 32),
+        target_hidden=torch.randn(2, 7, 96),
+    )
+    output.square().mean().backward()
+
+    gradient = model.layers[0].self_attn.q_proj.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
 
 
 def test_draft_sdpa_matches_eager_in_fp32():

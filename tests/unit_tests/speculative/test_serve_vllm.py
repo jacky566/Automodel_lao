@@ -483,6 +483,24 @@ def test_resolve_domino_draft_raises(tmp_path: Path):
         resolve_draft_artifacts(str(model_dir), dry_run=True)
 
 
+def test_resolve_visual_dflash_draft_raises(tmp_path: Path):
+    """A visual DFlash draft is rejected because vLLM cannot run its adaptor."""
+    model_dir = tmp_path / "model"
+    _write_dflash_checkpoint(
+        model_dir,
+        dflash_config={
+            "mask_token_id": 151669,
+            "target_layer_ids": [1, 18, 34],
+            "visual_num_query_tokens": 2,
+        },
+    )
+
+    with pytest.raises(ValueError, match="visual adaptor"):
+        resolve_draft_artifacts(str(model_dir))
+    with pytest.raises(ValueError, match="visual adaptor"):
+        resolve_draft_artifacts(str(model_dir), dry_run=True)
+
+
 def test_resolve_method_defaults_to_eagle3_for_eagle_and_hub_drafts(tmp_path: Path):
     """Method inference: eagle3 for an EAGLE draft config and for a pass-through Hub id."""
     assert serve_vllm._resolve_method(None, {"architectures": ["LlamaEagle3DraftModel"]}) == "eagle3"

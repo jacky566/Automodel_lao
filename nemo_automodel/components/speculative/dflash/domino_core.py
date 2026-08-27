@@ -297,6 +297,7 @@ class DominoTrainerModule(DFlashTrainerModule):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        multimodal_position_ids: torch.Tensor | None = None,
     ) -> DominoStepMetrics:
         """Parallel block-wise training forward with the Domino correction head.
 
@@ -305,8 +306,22 @@ class DominoTrainerModule(DFlashTrainerModule):
         is handled by the shared DFlash prologue; ``shift_label`` labels reaching
         one past the block (``anchor + block_size``) are truncated at the anchor's
         document boundary by ``_build_block_targets``.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            hidden_states: Tensor of shape [batch, sequence, target_layers * hidden].
+            loss_mask: Tensor of shape [batch, sequence].
+            lambda_base: Weight applied to the base DFlash loss.
+            position_ids: Optional long tensor of shape [batch, sequence].
+            seq_lens: Optional long tensor of shape [batch, documents].
+            doc_remaining: Optional long tensor of shape [batch, sequence].
+            multimodal_position_ids: Optional long tensor of shape [3, batch,
+                sequence], with temporal, height, and width positions.
+
+        Returns:
+            Scalar loss and additive Domino training metrics.
         """
-        _, seq_len = input_ids.shape
+        bsz, seq_len = input_ids.shape
         device = input_ids.device
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
@@ -315,8 +330,33 @@ class DominoTrainerModule(DFlashTrainerModule):
             )
         )
 
+        full_multimodal_position_ids = None
+        if self.draft_model.spatial_rope_enabled:
+            if multimodal_position_ids is None:
+                raise ValueError("multimodal_position_ids is required when spatial_rope_enabled=true.")
+            if tuple(multimodal_position_ids.shape) != (3, bsz, seq_len):
+                raise ValueError(
+                    "multimodal_position_ids must have shape [3, batch, sequence], "
+                    f"got {tuple(multimodal_position_ids.shape)} for batch={bsz}, sequence={seq_len}."
+                )
+            gather_indices = anchor_positions.clamp(min=0).unsqueeze(0).expand(3, -1, -1)
+            anchor_multimodal_positions = torch.gather(multimodal_position_ids, 2, gather_indices)
+            block_offsets = torch.arange(
+                self.block_size,
+                device=multimodal_position_ids.device,
+                dtype=multimodal_position_ids.dtype,
+            )
+            draft_multimodal_position_ids = (
+                anchor_multimodal_positions.unsqueeze(-1) + block_offsets.view(1, 1, 1, -1)
+            ).flatten(2)
+            full_multimodal_position_ids = torch.cat(
+                (multimodal_position_ids, draft_multimodal_position_ids),
+                dim=-1,
+            )
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
+            multimodal_position_ids=full_multimodal_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,

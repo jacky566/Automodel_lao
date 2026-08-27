@@ -511,6 +511,8 @@ class DFlashTrainerModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+        multimodal_position_ids: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -519,8 +521,40 @@ class DFlashTrainerModule(nn.Module):
         keeps every block inside one document: anchors are constrained so the block
         does not cross a boundary, the block's context prefix attends only within the
         anchor's document, and the draft's RoPE uses the per-document positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            hidden_states: Tensor of shape [batch, sequence, target_layers * hidden].
+            loss_mask: Tensor of shape [batch, sequence].
+            position_ids: Optional long tensor of shape [batch, sequence].
+            seq_lens: Optional long tensor of shape [batch, documents].
+            doc_remaining: Optional long tensor of shape [batch, sequence].
+            image_mask: Optional bool tensor of shape [batch, sequence], with True
+                at image-token positions.
+            multimodal_position_ids: Optional long tensor of shape [3, batch,
+                sequence], with temporal, height, and width positions.
+
+        Returns:
+            Scalar loss and additive DFlash training metrics.
         """
         bsz, seq_len = input_ids.shape
+
+        if self.draft_model.visual_conditioning_enabled and image_mask is not None:
+            if image_mask.shape != loss_mask.shape:
+                raise ValueError(
+                    "image_mask must have the same [batch, sequence] shape as loss_mask, "
+                    f"got {tuple(image_mask.shape)} and {tuple(loss_mask.shape)}."
+                )
+            # The two-query context pools every image token in the sample. An
+            # image after an earlier supervised token would therefore reveal a
+            # future turn while training that token. Reject such conversations
+            # instead of silently optimizing a non-causal objective.
+            supervised_prefix = loss_mask.to(dtype=torch.bool).cumsum(dim=1) > 0
+            if torch.any(image_mask.to(dtype=torch.bool) & supervised_prefix):
+                raise ValueError(
+                    "Visual DFlash requires every image token to appear before the first supervised token "
+                    "in its sample; later images would leak future visual information into the cached context."
+                )
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -528,11 +562,37 @@ class DFlashTrainerModule(nn.Module):
             )
         )
 
+        full_multimodal_position_ids = None
+        if self.draft_model.spatial_rope_enabled:
+            if multimodal_position_ids is None:
+                raise ValueError("multimodal_position_ids is required when spatial_rope_enabled=true.")
+            if tuple(multimodal_position_ids.shape) != (3, bsz, seq_len):
+                raise ValueError(
+                    "multimodal_position_ids must have shape [3, batch, sequence], "
+                    f"got {tuple(multimodal_position_ids.shape)} for batch={bsz}, sequence={seq_len}."
+                )
+            gather_indices = anchor_positions.clamp(min=0).unsqueeze(0).expand(3, -1, -1)
+            anchor_multimodal_positions = torch.gather(multimodal_position_ids, 2, gather_indices)
+            block_offsets = torch.arange(
+                self.block_size,
+                device=multimodal_position_ids.device,
+                dtype=multimodal_position_ids.dtype,
+            )
+            draft_multimodal_position_ids = (
+                anchor_multimodal_positions.unsqueeze(-1) + block_offsets.view(1, 1, 1, -1)
+            ).flatten(2)
+            full_multimodal_position_ids = torch.cat(
+                (multimodal_position_ids, draft_multimodal_position_ids),
+                dim=-1,
+            )
+
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
+            multimodal_position_ids=full_multimodal_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            image_mask=image_mask,
         )
         # A tensor-parallel target's lm_head is column-parallel and returns
         # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.

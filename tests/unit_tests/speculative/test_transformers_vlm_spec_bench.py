@@ -26,13 +26,22 @@ import torch.nn as nn
 
 from tools.transformers_vlm_spec_bench import (
     FIXED_NEW_TOKENS,
+    LEGACY_BENCHMARK_CONFIG,
+    LEGACY_BENCHMARKS,
+    LEGACY_NEW_TOKENS,
     REPRESENTATIVE_BENCHMARKS,
+    TEXT_BENCHMARK_CONFIG,
+    TEXT_BENCHMARKS,
     _acceptance_lengths,
+    _aggregate_position_acceptance,
+    _aggregate_proposal_offset_acceptance,
     _greedy_cached_forward,
     _load_baseline_throughput,
     _load_benchmark_specs,
     _load_sharegpt_vlm_prompts,
+    _load_text_prompts,
     _report_sample_progress,
+    _scale_visual_gate_state_dict,
 )
 
 
@@ -178,6 +187,71 @@ def test_acceptance_lengths_separates_accepted_draft_from_emitted_tokens() -> No
     assert _acceptance_lengths(0, 0) == (None, None)
 
 
+def test_aggregate_position_acceptance_uses_round_start_boundaries() -> None:
+    events = [
+        {"generated_position": 1, "accepted_tokens": 3, "draft_tokens": 7},
+        {"generated_position": 32, "accepted_tokens": 1, "draft_tokens": 7},
+        {"generated_position": 33, "accepted_tokens": 0, "draft_tokens": 7},
+        {"generated_position": 64, "accepted_tokens": 2, "draft_tokens": 7},
+        {"generated_position": 65, "accepted_tokens": 4, "draft_tokens": 7},
+        {"generated_position": 129, "accepted_tokens": 1, "draft_tokens": 7},
+    ]
+
+    result = _aggregate_position_acceptance(events, 256)
+
+    assert result["1-32"] == {
+        "verify_steps": 2,
+        "accepted_tokens": 4,
+        "draft_tokens": 14,
+        "accept_length": 2.0,
+        "emitted_tokens_per_step": 3.0,
+        "acceptance_rate": 4 / 14,
+    }
+    assert result["33-64"]["emitted_tokens_per_step"] == 2.0
+    assert result["65-128"]["emitted_tokens_per_step"] == 5.0
+    assert result["129-256"]["emitted_tokens_per_step"] == 2.0
+    assert "257-512" not in result
+
+
+def test_aggregate_proposal_offset_acceptance_uses_prefix_semantics() -> None:
+    events = [
+        {"generated_position": 1, "accepted_tokens": 3, "draft_tokens": 7},
+        {"generated_position": 5, "accepted_tokens": 1, "draft_tokens": 4},
+        {"generated_position": 7, "accepted_tokens": 0, "draft_tokens": 0},
+    ]
+
+    result = _aggregate_proposal_offset_acceptance(events)
+
+    assert result["1"] == {"opportunities": 2, "accepted": 2, "acceptance_rate": 1.0}
+    assert result["2"] == {"opportunities": 2, "accepted": 1, "acceptance_rate": 0.5}
+    assert result["3"] == {"opportunities": 2, "accepted": 1, "acceptance_rate": 0.5}
+    assert result["4"] == {"opportunities": 2, "accepted": 0, "acceptance_rate": 0.0}
+    assert result["5"] == {"opportunities": 1, "accepted": 0, "acceptance_rate": 0.0}
+    assert tuple(result) == ("1", "2", "3", "4", "5", "6", "7")
+
+
+def test_scale_visual_gate_state_dict_changes_only_scalar_visual_gates() -> None:
+    """The ablation multiplier targets each visual gate without changing backbone tensors."""
+    backbone = torch.tensor([1.0, 2.0])
+    state_dict = {
+        "layers.0.visual_fusion.gate": torch.tensor(-0.25),
+        "layers.1.visual_fusion.gate": torch.tensor(0.5),
+        "layers.0.self_attn.weight": backbone,
+    }
+
+    _scale_visual_gate_state_dict(state_dict, 2.0)
+
+    assert state_dict["layers.0.visual_fusion.gate"].item() == -0.5
+    assert state_dict["layers.1.visual_fusion.gate"].item() == 1.0
+    assert state_dict["layers.0.self_attn.weight"] is backbone
+
+
+def test_scale_visual_gate_state_dict_rejects_checkpoint_without_visual_gates() -> None:
+    """A gate ablation cannot silently run against an incompatible checkpoint."""
+    with pytest.raises(ValueError, match="requires a DFlash checkpoint"):
+        _scale_visual_gate_state_dict({"layers.0.self_attn.weight": torch.ones(1)}, 0.5)
+
+
 def test_representative_suite_has_four_benchmarks_with_fixed_512_token_outputs() -> None:
     """The default suite spans four task types with an identical generation length."""
     specs = _load_benchmark_specs()
@@ -185,6 +259,44 @@ def test_representative_suite_has_four_benchmarks_with_fixed_512_token_outputs()
     assert tuple(spec["name"] for spec in specs) == REPRESENTATIVE_BENCHMARKS
     assert len(specs) == 4
     assert {spec["max_new_tokens"] for spec in specs} == {FIXED_NEW_TOKENS}
+
+
+def test_legacy_suite_has_original_five_benchmarks_with_fixed_256_token_outputs() -> None:
+    """The original benchmark set is available with one standardized output length."""
+    specs = _load_benchmark_specs(LEGACY_BENCHMARK_CONFIG, LEGACY_BENCHMARKS, LEGACY_NEW_TOKENS)
+
+    assert tuple(spec["name"] for spec in specs) == LEGACY_BENCHMARKS
+    assert {spec["max_new_tokens"] for spec in specs} == {LEGACY_NEW_TOKENS}
+
+
+def test_text_suite_has_four_benchmarks_with_fixed_256_token_outputs() -> None:
+    specs = _load_benchmark_specs(TEXT_BENCHMARK_CONFIG, TEXT_BENCHMARKS, LEGACY_NEW_TOKENS)
+
+    assert tuple(spec["name"] for spec in specs) == TEXT_BENCHMARKS
+    assert {spec["max_new_tokens"] for spec in specs} == {LEGACY_NEW_TOKENS}
+
+
+def test_load_text_prompts_uses_first_list_turn_and_appends_context(monkeypatch) -> None:
+    from tools import transformers_vlm_spec_bench as benchmark
+
+    rows = [
+        {"prompt": ["first turn", "second turn"], "context": "details"},
+        {"prompt": "plain prompt", "context": ""},
+    ]
+    monkeypatch.setattr(benchmark, "_load_hf_rows", lambda *args, **kwargs: rows)
+
+    prompts = _load_text_prompts(
+        {
+            "name": "tiny",
+            "input_data": "unused",
+            "prompt_column": "prompt",
+            "prompt_context_column": "context",
+        },
+        2,
+    )
+
+    assert prompts[0][0]["content"][0]["text"] == "first turn\n\ndetails"
+    assert prompts[1][0]["content"][0]["text"] == "plain prompt"
 
 
 def test_sample_progress_reports_benchmark_and_position(caplog) -> None:
@@ -251,6 +363,8 @@ def test_dflash_main_does_not_run_an_internal_baseline(monkeypatch, tmp_path) ->
             "draft",
             "--mode",
             "dflash",
+            "--visual-gate-multiplier",
+            "0.5",
             "--num-prompts",
             "1",
             "--output",
@@ -260,18 +374,134 @@ def test_dflash_main_does_not_run_an_internal_baseline(monkeypatch, tmp_path) ->
     monkeypatch.setattr(
         benchmark,
         "_load_benchmark_specs",
-        lambda: [{"name": "scienceqa"}],
+        lambda *args: [{"name": "scienceqa", "max_new_tokens": FIXED_NEW_TOKENS}],
     )
     monkeypatch.setattr(benchmark, "_load_official_prompts", lambda spec, count: [[{"role": "user"}]])
     monkeypatch.setattr(benchmark, "_load_target", lambda *args: object())
     monkeypatch.setattr(benchmark.AutoProcessor, "from_pretrained", lambda *args: object())
-    monkeypatch.setattr(benchmark, "_load_dflash", lambda *args: object())
+    received: dict[str, object] = {}
+
+    def fake_load_dflash(*args, **kwargs):
+        received.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(benchmark, "_load_dflash", fake_load_dflash)
     monkeypatch.setattr(benchmark, "_baseline", lambda *args, **kwargs: pytest.fail("unexpected baseline"))
     monkeypatch.setattr(benchmark, "_dflash", lambda *args, **kwargs: {"tok_s": 75.0})
 
     benchmark.main()
 
-    assert json.loads(output.read_text())["scienceqa"]["mode"] == "dflash"
+    result = json.loads(output.read_text())["scienceqa"]
+    assert received["visual_gate_multiplier"] == 0.5
+    assert result["mode"] == "dflash"
+    assert result["visual_gate_multiplier"] == 0.5
+    assert result["target_parity_checked"] is False
+
+
+def test_dflash_main_can_check_target_parity(monkeypatch, tmp_path) -> None:
+    """The opt-in parity check forwards greedy target token IDs to DFlash."""
+    from tools import transformers_vlm_spec_bench as benchmark
+
+    output = tmp_path / "dflash_parity.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "transformers_vlm_spec_bench.py",
+            "--target",
+            "target",
+            "--draft",
+            "draft",
+            "--mode",
+            "dflash",
+            "--check-target-parity",
+            "--num-prompts",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_load_benchmark_specs",
+        lambda *args: [{"name": "scienceqa", "max_new_tokens": FIXED_NEW_TOKENS}],
+    )
+    prompts = [[{"role": "user"}]]
+    monkeypatch.setattr(benchmark, "_load_official_prompts", lambda spec, count: prompts)
+    monkeypatch.setattr(benchmark, "_load_target", lambda *args: object())
+    monkeypatch.setattr(benchmark.AutoProcessor, "from_pretrained", lambda *args: object())
+    monkeypatch.setattr(benchmark, "_load_dflash", lambda *args, **kwargs: object())
+    references = [[1, 2, 3]]
+    monkeypatch.setattr(
+        benchmark,
+        "_baseline",
+        lambda *args, **kwargs: {"_reference_outputs": references},
+    )
+    received: dict[str, object] = {}
+
+    def fake_dflash(*args, **kwargs):
+        received.update(kwargs)
+        return {"tok_s": 75.0, "exact_match_rate": 1.0, "token_match_rate": 1.0}
+
+    monkeypatch.setattr(benchmark, "_dflash", fake_dflash)
+
+    benchmark.main()
+
+    result = json.loads(output.read_text())["scienceqa"]
+    assert received["reference_outputs"] == references
+    assert result["target_parity_checked"] is True
+    assert result["exact_match_rate"] == 1.0
+    assert result["token_match_rate"] == 1.0
+
+
+def test_vispec_main_configures_top_one_chain_ablation(monkeypatch, tmp_path) -> None:
+    """The chain ablation retains one candidate per ViSpec draft depth."""
+    from tools import transformers_vlm_spec_bench as benchmark
+
+    output = tmp_path / "vispec_chain.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "transformers_vlm_spec_bench.py",
+            "--target",
+            "target",
+            "--draft",
+            "draft",
+            "--mode",
+            "vispec",
+            "--vispec-proposal-mode",
+            "chain",
+            "--num-prompts",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "_load_benchmark_specs",
+        lambda *args: [{"name": "scienceqa", "max_new_tokens": FIXED_NEW_TOKENS}],
+    )
+    monkeypatch.setattr(benchmark, "_load_official_prompts", lambda spec, count: [[{"role": "user"}]])
+    monkeypatch.setattr(benchmark, "_load_target", lambda *args: object())
+    monkeypatch.setattr(benchmark.AutoProcessor, "from_pretrained", lambda *args: object())
+    monkeypatch.setattr(benchmark, "_load_vispec", lambda *args: object())
+    received: dict[str, object] = {}
+
+    def fake_vispec(*args, **kwargs):
+        received.update(kwargs)
+        return {"tok_s": 75.0}
+
+    monkeypatch.setattr(benchmark, "_vispec", fake_vispec)
+
+    benchmark.main()
+
+    result = json.loads(output.read_text())["scienceqa"]
+    assert received["proposal_mode"] == "chain"
+    assert result["verification_mode"] == "chain"
+    assert result["vispec_top_k"] == 1
+    assert result["vispec_total_token"] == benchmark.VISPEC_DEPTH + 2
 
 
 def test_load_sharegpt_vlm_prompts_preserves_image_order(tmp_path) -> None:

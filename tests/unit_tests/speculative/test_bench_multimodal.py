@@ -145,3 +145,31 @@ def test_gqa_loader_requires_instruction_config():
     )
     with pytest.raises(ValueError, match="instructions"):
         load_multimodal_prompts(args, lambda *args, **kwargs: [])
+
+
+def test_charxiv_reasoning_uses_reasoning_question_and_image():
+    prompt = adapt_multimodal_row(
+        {"reasoning_q": "Which line declines fastest?", "image": b"jpeg"},
+        MultimodalBenchmark.CHARXIV_REASONING,
+    )
+
+    assert prompt is not None
+    assert prompt[0]["content"][0]["text"] == "Which line declines fastest?"
+    assert prompt[0]["content"][-1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_mmmu_pro_interleaves_numbered_images_and_options():
+    prompt = adapt_multimodal_row(
+        {
+            "question": "Compare <image 1> with <image 2>.",
+            "options": "['first', 'second', 'same', 'unknown']",
+            "image_1": b"first",
+            "image_2": b"second",
+        },
+        MultimodalBenchmark.MMMU_PRO,
+    )
+
+    assert prompt is not None
+    content = prompt[0]["content"]
+    assert [item["type"] for item in content] == ["text", "image_url", "text", "image_url", "text", "text"]
+    assert "Options: (A) first (B) second (C) same (D) unknown" in content[-2]["text"]

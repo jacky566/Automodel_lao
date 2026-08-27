@@ -43,6 +43,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    load_hf_safetensors_state_dict,
     load_torch_ckpt,
     save_config,
 )
@@ -72,6 +73,19 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_image_token_id(target_config, processor) -> int:
+    """Resolve the image-placeholder id used to select cached target features."""
+    image_token_id = getattr(target_config, "image_token_id", None)
+    if image_token_id is not None:
+        return int(image_token_id)
+    image_token = getattr(processor, "image_token", None)
+    if image_token is None:
+        raise ValueError(
+            "Visual DFlash could not resolve an image token from target config.image_token_id or processor.image_token."
+        )
+    return int(processor.tokenizer.convert_tokens_to_ids(image_token))
 
 
 def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
@@ -245,10 +259,51 @@ class TrainDFlashRecipe(BaseRecipe):
         # width) so the two never disagree.
         num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
+        self.spatial_rope_enabled = bool(recipe_cfg.get("spatial_rope_enabled", False))
+        self.spatial_rope_mode = str(recipe_cfg.get("spatial_rope_mode", "gated"))
+        if self.spatial_rope_enabled and not self.is_multimodal:
+            raise ValueError("spatial_rope_enabled is supported only for multimodal DFlash targets.")
+        if self.spatial_rope_enabled and self.spatial_rope_mode not in {"gated", "replace"}:
+            raise ValueError(f"spatial_rope_mode must be 'gated' or 'replace', got {self.spatial_rope_mode!r}.")
+        target_rope_config = getattr(target_text_config, "rope_scaling", None) or getattr(
+            target_text_config, "rope_parameters", None
+        )
+        configured_sections = recipe_cfg.get("spatial_rope_sections", None)
+        if configured_sections is None and isinstance(target_rope_config, dict):
+            configured_sections = target_rope_config.get("mrope_section", None)
+        self.spatial_rope_sections = list(configured_sections or [])
+        if self.spatial_rope_enabled and len(self.spatial_rope_sections) != 3:
+            raise ValueError(
+                "spatial_rope_enabled requires three spatial_rope_sections from the target config or recipe, "
+                f"got {self.spatial_rope_sections}."
+            )
+        self.layer_routing_enabled = bool(recipe_cfg.get("layer_routing_enabled", False))
+        if self.layer_routing_enabled and not self.is_multimodal:
+            raise ValueError("layer_routing_enabled is supported only for multimodal DFlash targets.")
+        self.visual_num_query_tokens = int(recipe_cfg.get("visual_num_query_tokens", 0) or 0)
+        if self.visual_num_query_tokens > 0 and not self.is_multimodal:
+            raise ValueError("visual_num_query_tokens is supported only for multimodal DFlash targets.")
+        self.visual_image_token_id = (
+            _resolve_image_token_id(target_config, self.processor) if self.visual_num_query_tokens > 0 else None
+        )
+        enabled_variants = sum(
+            (self.spatial_rope_enabled, self.layer_routing_enabled, self.visual_num_query_tokens > 0)
+        )
+        if enabled_variants > 1:
+            raise ValueError(
+                "Enable only one diagnostic DFlash variant at a time: spatial RoPE, layer routing, or visual adaptor."
+            )
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
+        if (self.visual_num_query_tokens > 0 or self.layer_routing_enabled) and len(
+            target_layer_ids
+        ) != draft_num_hidden_layers:
+            raise ValueError(
+                "This DFlash variant pairs one captured target layer with each draft layer, so target_layer_ids must "
+                f"contain {draft_num_hidden_layers} entries, got {len(target_layer_ids)}."
+            )
         self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
@@ -294,11 +349,27 @@ class TrainDFlashRecipe(BaseRecipe):
             dflash_config=self._build_dflash_config(recipe_cfg, target_layer_ids),
             attention_backend=attention_backend,
         )
+        if self.visual_num_query_tokens > 0:
+            # The warm start overwrites the backbone but not the new visual
+            # modules. Seed before construction so their initialization is
+            # reproducible and identical across data-parallel ranks.
+            torch.manual_seed(int(recipe_cfg.get("shuffle_seed", 42)))
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        draft_init_from = recipe_cfg.get("draft_init_from", None)
+        if self.visual_num_query_tokens > 0 and not draft_init_from:
+            raise ValueError(
+                "The DFlash visual-adaptor diagnostic requires recipe_args.draft_init_from so the existing "
+                "backbone is warm-started instead of trained from scratch."
+            )
+        if draft_init_from:
+            self._load_draft_init(str(draft_init_from))
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
         apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
+        # Freeze after parameter-replacing transforms so a staged recipe cannot
+        # accidentally train newly swapped backbone parameters.
+        self._apply_draft_training_stage(recipe_cfg)
 
         trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
@@ -319,8 +390,26 @@ class TrainDFlashRecipe(BaseRecipe):
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
+        if self.visual_num_query_tokens > 0:
+            visual_parameters = [
+                parameter for parameter in self.draft_model.visual_parameters() if parameter.requires_grad
+            ]
+            backbone_parameters = [
+                parameter for parameter in self.draft_model.backbone_parameters() if parameter.requires_grad
+            ]
+            parameter_groups = []
+            if backbone_parameters:
+                parameter_groups.append(
+                    {"params": backbone_parameters, "lr": float(opt_cfg.get("backbone_lr", self.peak_lr))}
+                )
+            if visual_parameters:
+                parameter_groups.append(
+                    {"params": visual_parameters, "lr": float(opt_cfg.get("visual_lr", self.peak_lr))}
+                )
+        else:
+            parameter_groups = [parameter for parameter in self.trainer_module.parameters() if parameter.requires_grad]
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.trainer_module.parameters() if p.requires_grad],
+            parameter_groups,
             lr=self.peak_lr,
             betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
             weight_decay=opt_cfg.get("weight_decay", 0.0),
@@ -341,9 +430,13 @@ class TrainDFlashRecipe(BaseRecipe):
             num_batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             num_batches_per_epoch = 0
-        total_optim_steps = max(
+        epoch_optim_steps = max(
             1, self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
         )
+        max_steps = recipe_cfg.get("max_steps", None)
+        if max_steps is not None and int(max_steps) <= 0:
+            raise ValueError(f"recipe_args.max_steps must be > 0, got {max_steps}.")
+        total_optim_steps = min(epoch_optim_steps, int(max_steps)) if max_steps is not None else epoch_optim_steps
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
@@ -504,15 +597,43 @@ class TrainDFlashRecipe(BaseRecipe):
         Subclasses override to capture extra teacher signals (e.g. JetSpec also
         captures the target logits for its forward-KL distillation).
         """
-        wrapper_cls = HFMultimodalDFlashTargetModel if self.is_multimodal else HFDFlashTargetModel
-        return wrapper_cls(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None))
+        if self.is_multimodal:
+            return HFMultimodalDFlashTargetModel(
+                self.target_model,
+                target_layer_ids=target_layer_ids,
+                cp_mesh=getattr(self, "cp_mesh", None),
+                image_token_id=self.visual_image_token_id,
+                capture_multimodal_positions=self.spatial_rope_enabled,
+            )
+        return HFDFlashTargetModel(
+            self.target_model,
+            target_layer_ids=target_layer_ids,
+            cp_mesh=getattr(self, "cp_mesh", None),
+        )
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
-        return {
+        dflash_config = {
             "mask_token_id": self.mask_token_id,
             "target_layer_ids": target_layer_ids,
+            "layer_routing_enabled": self.layer_routing_enabled,
+            "spatial_rope_enabled": self.spatial_rope_enabled,
         }
+        if self.spatial_rope_enabled:
+            dflash_config["spatial_rope_sections"] = self.spatial_rope_sections
+            dflash_config["spatial_rope_mode"] = self.spatial_rope_mode
+        if self.visual_num_query_tokens > 0:
+            dflash_config.update(
+                {
+                    "visual_num_query_tokens": self.visual_num_query_tokens,
+                    "visual_adapter_type": str(recipe_cfg.get("visual_adapter_type", "cross_attention")),
+                    "visual_adapter_dim": int(recipe_cfg.get("visual_adapter_dim", 256)),
+                    "visual_num_attention_heads": int(recipe_cfg.get("visual_num_attention_heads", 4)),
+                    "visual_gate_init": float(recipe_cfg.get("visual_gate_init", 1.0e-3)),
+                    "visual_image_token_id": self.visual_image_token_id,
+                }
+            )
+        return dflash_config
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the trainer wrapper. Subclasses override to swap the wrapper (e.g. Domino)."""
@@ -543,7 +664,55 @@ class TrainDFlashRecipe(BaseRecipe):
             position_ids=target_batch.position_ids,
             seq_lens=target_batch.seq_lens,
             doc_remaining=target_batch.doc_remaining,
+            image_mask=target_batch.image_mask,
+            multimodal_position_ids=target_batch.multimodal_position_ids,
         )
+
+    def _load_draft_init(self, draft_init_from: str) -> None:
+        """Warm-start DFlash from a consolidated draft export.
+
+        Args:
+            draft_init_from: Directory containing consolidated safetensors, or a
+                single safetensors shard. Newly added ``visual_fusion`` keys may
+                be absent only when the destination draft has visual conditioning.
+        """
+        state_dict = load_hf_safetensors_state_dict(draft_init_from)
+        if state_dict is None:
+            raise FileNotFoundError(
+                f"recipe_args.draft_init_from {draft_init_from} contains no readable safetensors checkpoint."
+            )
+        missing, unexpected = self.draft_model.load_state_dict(state_dict, strict=False)
+        allow_new_visual_parameters = bool(self.draft_model.visual_conditioning_enabled)
+        allow_new_layer_routing_parameters = bool(self.draft_model.layer_routing_enabled)
+        allow_new_spatial_rope_parameters = self.draft_model.spatial_rope_gates is not None
+        unresolved_missing = [
+            name
+            for name in missing
+            if not (
+                (allow_new_visual_parameters and ".visual_fusion." in name)
+                or (allow_new_layer_routing_parameters and name == "layer_route_gates")
+                or (allow_new_spatial_rope_parameters and name == "spatial_rope_gates")
+            )
+        ]
+        if unresolved_missing or unexpected:
+            raise ValueError(
+                f"Draft checkpoint {draft_init_from} is incompatible: missing={sorted(unresolved_missing)}, "
+                f"unexpected={sorted(unexpected)}."
+            )
+        logger.info(
+            "Initialized DFlash from %s; newly initialized %d variant parameter tensors.",
+            draft_init_from,
+            len(missing),
+        )
+
+    def _apply_draft_training_stage(self, recipe_cfg) -> None:
+        """Apply the optional visual-adaptor freeze policy before optimizer construction."""
+        if self.spatial_rope_enabled:
+            self.draft_model.set_spatial_rope_training_stage(str(recipe_cfg.get("training_stage", "spatial_rope")))
+        elif self.layer_routing_enabled:
+            self.draft_model.set_layer_routing_training_stage(str(recipe_cfg.get("training_stage", "layer_routing")))
+        elif self.visual_num_query_tokens > 0:
+            self.draft_model.set_training_stage(str(recipe_cfg.get("training_stage", "visual_adaptor")))
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
@@ -931,6 +1100,10 @@ class TrainDFlashRecipe(BaseRecipe):
         self.trainer_module.train()
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
         start_batch_idx = max(0, int(getattr(self, "_resume_batch_idx", 0)))
+        if self.runtime.global_step >= self.total_optim_steps:
+            if self.dist_env.is_main:
+                logger.info("Training budget of %d optimizer steps is already complete.", self.total_optim_steps)
+            return
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
@@ -938,6 +1111,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
         try:
+            stop_training = False
             for epoch_idx in range(start_epoch, self.num_epochs):
                 if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                     self.train_dataloader.sampler.set_epoch(epoch_idx)
@@ -1027,6 +1201,8 @@ class TrainDFlashRecipe(BaseRecipe):
                         completed_steps += 1
                         pending_micro_batches = 0
                         self._maybe_save_step_checkpoint(epoch_idx)
+                        if self.runtime.global_step >= self.total_optim_steps:
+                            stop_training = True
 
                         if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
                             # Average over the micro-batches accumulated since the last
@@ -1070,6 +1246,8 @@ class TrainDFlashRecipe(BaseRecipe):
                             running_acc = 0.0
                             running_micro = 0
                             running_extra.clear()
+                        if stop_training:
+                            break
 
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
@@ -1088,6 +1266,8 @@ class TrainDFlashRecipe(BaseRecipe):
                     completed_steps += 1
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch_idx)
+                    if self.runtime.global_step >= self.total_optim_steps:
+                        stop_training = True
 
                 eval_metrics = self._run_eval()
                 self._next_batch_idx = 0
@@ -1115,6 +1295,9 @@ class TrainDFlashRecipe(BaseRecipe):
                         is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
                     )
                     self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
+
+                if stop_training:
+                    break
 
             self._maybe_save_final_checkpoint(self.num_epochs)
             self._finalize_and_close_checkpointer()

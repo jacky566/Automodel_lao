@@ -30,6 +30,7 @@ import logging
 
 import torch
 
+from nemo_automodel.components.checkpoint.checkpointing import load_hf_safetensors_state_dict
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.domino_core import DominoTrainerModule, get_lambda_base
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
@@ -76,6 +77,44 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             shift_label=self.draft_model.shift_label,
         )
 
+    def _load_draft_init(self, draft_init_from: str) -> None:
+        """Warm-start Domino from either a complete Domino or base DFlash draft.
+
+        Args:
+            draft_init_from: Consolidated safetensors directory or shard. A base
+                DFlash checkpoint may omit the newly initialized Domino head.
+        """
+        state_dict = load_hf_safetensors_state_dict(draft_init_from)
+        if state_dict is None:
+            raise FileNotFoundError(
+                f"recipe_args.draft_init_from {draft_init_from} contains no readable safetensors checkpoint."
+            )
+        source_has_domino_head = any(
+            name.startswith("prefix_gru.") or name.startswith("embed_proj.") for name in state_dict
+        )
+        missing, unexpected = self.draft_model.load_state_dict(state_dict, strict=False)
+        unresolved_missing = [
+            name
+            for name in missing
+            if source_has_domino_head or not (name.startswith("prefix_gru.") or name.startswith("embed_proj."))
+        ]
+        if unresolved_missing or unexpected:
+            raise ValueError(
+                f"Draft checkpoint {draft_init_from} is incompatible: missing={sorted(unresolved_missing)}, "
+                f"unexpected={sorted(unexpected)}."
+            )
+        logger.info(
+            "Initialized Domino from %s; newly initialized %d causal-head parameter tensors.",
+            draft_init_from,
+            len(missing),
+        )
+
+    def _apply_draft_training_stage(self, recipe_cfg) -> None:
+        """Apply an optional Domino head-only or joint freeze policy."""
+        training_stage = recipe_cfg.get("training_stage", None)
+        if training_stage is not None:
+            self.draft_model.set_domino_training_stage(str(training_stage))
+
     def setup(self):
         """Build everything via the DFlash recipe, then read the lambda_base schedule."""
         super().setup()
@@ -100,6 +139,7 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             position_ids=target_batch.position_ids,
             seq_lens=target_batch.seq_lens,
             doc_remaining=target_batch.doc_remaining,
+            multimodal_position_ids=target_batch.multimodal_position_ids,
         )
         self._last_domino_metrics = metrics
         return metrics

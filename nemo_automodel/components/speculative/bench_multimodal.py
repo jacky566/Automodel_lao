@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import io
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -34,6 +36,8 @@ class MultimodalBenchmark(str, Enum):
     VIZWIZ = "vizwiz"
     GQA = "gqa"
     SEED_BENCH = "seed_bench"
+    CHARXIV_REASONING = "charxiv_reasoning"
+    MMMU_PRO = "mmmu_pro"
 
 
 def _image_data_url(image: Any) -> str:
@@ -103,6 +107,43 @@ def _multiple_choice_text(row: dict[str, Any]) -> str | None:
     )
 
 
+def _mmmu_pro_prompt(row: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Build one interleaved multi-image MMMU-Pro conversation."""
+    question = row.get("question")
+    options = row.get("options")
+    if not isinstance(question, str) or not question.strip() or not isinstance(options, str):
+        return None
+    try:
+        parsed_options = ast.literal_eval(options)
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(parsed_options, list) or not all(isinstance(option, str) for option in parsed_options):
+        return None
+    labels = [chr(ord("A") + index) for index in range(len(parsed_options))]
+    option_text = " ".join(f"({label}) {option}" for label, option in zip(labels, parsed_options))
+    text = f"{question.strip()}\nOptions: {option_text}"
+    content: list[dict[str, Any]] = []
+    for part in re.split(r"(<image\s+\d+>)", text):
+        match = re.fullmatch(r"<image\s+(\d+)>", part)
+        if match is None:
+            if part.strip():
+                content.append({"type": "text", "text": part.strip()})
+            continue
+        image = row.get(f"image_{match.group(1)}")
+        if image is None:
+            return None
+        content.append({"type": "image_url", "image_url": {"url": _image_data_url(image)}})
+    if not any(item["type"] == "image_url" for item in content):
+        return None
+    content.append(
+        {
+            "type": "text",
+            "text": 'Your answer should begin with "The answer is". Please answer with an explanation.',
+        }
+    )
+    return [{"role": "user", "content": content}]
+
+
 def adapt_multimodal_row(row: dict[str, Any], benchmark: MultimodalBenchmark) -> list[dict[str, Any]] | None:
     """Convert one supported benchmark row into OpenAI Vision messages."""
     if benchmark is MultimodalBenchmark.SCIENCEQA:
@@ -125,6 +166,10 @@ def adapt_multimodal_row(row: dict[str, Any], benchmark: MultimodalBenchmark) ->
         if row.get("data_type") != "image" or not isinstance(images, list) or not images:
             return None
         return _benchmark_prompt(_multiple_choice_text(row), images[0], "")
+    if benchmark is MultimodalBenchmark.CHARXIV_REASONING:
+        return _benchmark_prompt(row.get("reasoning_q"), row.get("image"), "Please answer with an explanation.")
+    if benchmark is MultimodalBenchmark.MMMU_PRO:
+        return _mmmu_pro_prompt(row)
     if benchmark in {
         MultimodalBenchmark.MMVET,
         MultimodalBenchmark.MME,

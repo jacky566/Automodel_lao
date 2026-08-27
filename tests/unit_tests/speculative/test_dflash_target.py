@@ -137,6 +137,40 @@ class _FakeMultimodalBackbone(nn.Module):
             hidden = layer(hidden)
         return hidden
 
+    def compute_3d_position_ids(
+        self,
+        input_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None,
+        video_grid_thw: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        attention_mask: torch.Tensor,
+        past_key_values: object | None,
+        second_per_grid_ts: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return deterministic temporal, height, and width positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            image_grid_thw: Optional long tensor of shape [images, 3].
+            video_grid_thw: Optional long tensor of shape [videos, 3].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            attention_mask: Tensor of shape [batch, sequence].
+            past_key_values: Optional target cache; unused by this fake model.
+            second_per_grid_ts: Optional tensor of shape [videos].
+            mm_token_type_ids: Optional tensor of shape [batch, sequence].
+
+        Returns:
+            Long tensor of shape [3, batch, sequence].
+        """
+        del image_grid_thw, video_grid_thw, inputs_embeds, past_key_values, second_per_grid_ts
+        positions = (attention_mask.long().cumsum(dim=-1) - 1).clamp_min(0)
+        positions = positions.unsqueeze(0).expand(3, -1, -1).clone()
+        if mm_token_type_ids is not None:
+            positions[1] += mm_token_type_ids
+            positions[2] += 2 * mm_token_type_ids
+        return positions
+
 
 class _FakeMultimodalLM(nn.Module):
     """Image-text target with language layers below ``model.language_model``."""
@@ -276,8 +310,10 @@ def test_capture_logits_handles_bare_tensor_return():
 
 
 def test_multimodal_target_captures_language_layers_with_pixels():
-    target = HFMultimodalDFlashTargetModel(_FakeMultimodalLM(), target_layer_ids=[1, 3])
+    image_token_id = 7
+    target = HFMultimodalDFlashTargetModel(_FakeMultimodalLM(), target_layer_ids=[1, 3], image_token_id=image_token_id)
     input_ids, attention_mask, loss_mask = _batch(batch=2, seq=8)
+    input_ids[:, 2:4] = image_token_id
     loss_mask[:, :4] = 0
     pixel_values = torch.randn(2, _HIDDEN)
 
@@ -293,6 +329,7 @@ def test_multimodal_target_captures_language_layers_with_pixels():
     assert torch.equal(output.input_ids, input_ids)
     assert torch.equal(output.loss_mask, loss_mask)
     assert output.loss_mask[:, :4].count_nonzero() == 0
+    assert torch.equal(output.image_mask, input_ids == image_token_id)
 
 
 def test_multimodal_target_forwards_qwen3_vl_processor_tensors():
@@ -322,3 +359,29 @@ def test_multimodal_target_forwards_qwen3_vl_processor_tensors():
     assert torch.equal(model.forward_inputs["mm_token_type_ids"], token_types)
     assert torch.equal(model.forward_inputs["position_ids"], position_ids)
     assert torch.equal(output.position_ids, position_ids)
+
+
+def test_multimodal_target_captures_computed_3d_positions() -> None:
+    model = _FakeMultimodalLM()
+    target = HFMultimodalDFlashTargetModel(
+        model,
+        target_layer_ids=[1, 3],
+        capture_multimodal_positions=True,
+    )
+    input_ids, attention_mask, loss_mask = _batch(batch=2, seq=8)
+    token_types = torch.zeros_like(input_ids)
+    token_types[:, 2:4] = 1
+
+    output = target.generate_batch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        pixel_values=torch.randn(2, _HIDDEN),
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+        mm_token_type_ids=token_types,
+    )
+
+    assert output.multimodal_position_ids is not None
+    assert output.multimodal_position_ids.shape == (3, 2, 8)
+    torch.testing.assert_close(model.forward_inputs["position_ids"], output.multimodal_position_ids)
+    assert not torch.equal(output.multimodal_position_ids[0], output.multimodal_position_ids[1])

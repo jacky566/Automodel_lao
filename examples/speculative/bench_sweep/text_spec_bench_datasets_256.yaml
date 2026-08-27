@@ -1,0 +1,29 @@
+# Text-only control suite for VLM speculative-decoding diagnostics.
+# Every task uses the same 256-token fixed generation budget as legacy5.
+
+datasets:
+  - name: mt_bench
+    input_data: HuggingFaceH4/mt_bench_prompts
+    split: train
+    prompt_column: prompt
+    max_new_tokens: 256
+
+  - name: humaneval
+    input_data: openai/openai_humaneval
+    split: test
+    prompt_column: prompt
+    max_new_tokens: 256
+
+  - name: gsm8k
+    input_data: openai/gsm8k
+    dataset_name: main
+    split: test
+    prompt_column: question
+    max_new_tokens: 256
+
+  - name: alpaca
+    input_data: tatsu-lab/alpaca
+    split: train
+    prompt_column: instruction
+    prompt_context_column: input
+    max_new_tokens: 256

@@ -442,6 +442,13 @@ def resolve_draft_artifacts(
             "so it is not servable here. Serve a plain DFlash or JetSpec draft instead."
         )
 
+    if int((config.get("dflash_config") or {}).get("visual_num_query_tokens", 0) or 0) > 0:
+        raise ValueError(
+            "this draft contains the cached DFlash visual adaptor (dflash_config.visual_num_query_tokens > 0), "
+            "but vLLM's dflash runtime does not implement that adaptor. Use the local Transformers multimodal "
+            "speculative evaluator instead; serving the bare DFlash backbone would produce incorrect results."
+        )
+
     # Automodel drafts carry a ``self.model`` wrapper prefix on their weights that
     # vLLM cannot load; those need a remapped export. A draft whose weights are
     # already vLLM-standard only needs the in-place config fixups.

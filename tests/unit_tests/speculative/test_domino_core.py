@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -28,6 +30,8 @@ from nemo_automodel.components.speculative.dflash.domino_core import (
     get_lambda_base,
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
+from nemo_automodel.recipes.llm import train_domino
+from nemo_automodel.recipes.llm.train_domino import TrainDominoRecipe
 
 VOCAB = 64
 HIDDEN = 32
@@ -52,7 +56,7 @@ class _TinyDominoTarget(nn.Module):
         return self.embed_tokens
 
 
-def _draft_config(projector_type="domino", pure_prefix=1, shift_label=True):
+def _draft_config(projector_type="domino", pure_prefix=1, shift_label=True, spatial_rope=False):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -77,6 +81,14 @@ def _draft_config(projector_type="domino", pure_prefix=1, shift_label=True):
                 "gru_hidden_dim": GRU_HIDDEN,
                 "pure_draft_prefix_len": pure_prefix,
                 "shift_label": shift_label,
+            }
+        )
+    if spatial_rope:
+        dflash_config.update(
+            {
+                "spatial_rope_enabled": True,
+                "spatial_rope_mode": "replace",
+                "spatial_rope_sections": [1, 1, 2],
             }
         )
     cfg.dflash_config = dflash_config
@@ -124,6 +136,41 @@ def test_draft_builds_domino_head():
     assert draft.embed_proj[-1].out_features == VOCAB
     assert draft.shift_label is True
     assert draft.pure_draft_prefix_len == 1
+
+
+def test_domino_head_stage_freezes_backbone() -> None:
+    draft = Qwen3DFlashDraftModel(_draft_config())
+
+    draft.set_domino_training_stage("domino_head")
+
+    head_ids = {id(parameter) for parameter in draft.domino_parameters()}
+    assert head_ids
+    assert all(parameter.requires_grad == (id(parameter) in head_ids) for parameter in draft.parameters())
+
+
+def test_domino_warm_start_accepts_base_dflash_checkpoint(monkeypatch) -> None:
+    base = Qwen3DFlashDraftModel(_draft_config(projector_type=None))
+    recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
+    recipe.draft_model = Qwen3DFlashDraftModel(_draft_config())
+    monkeypatch.setattr(
+        train_domino,
+        "load_hf_safetensors_state_dict",
+        lambda _path: copy.deepcopy(base.state_dict()),
+    )
+
+    recipe._load_draft_init("base-dflash")
+
+
+def test_domino_warm_start_rejects_partial_domino_head(monkeypatch) -> None:
+    source = Qwen3DFlashDraftModel(_draft_config())
+    state_dict = copy.deepcopy(source.state_dict())
+    state_dict.pop("embed_proj.2.weight")
+    recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
+    recipe.draft_model = Qwen3DFlashDraftModel(_draft_config())
+    monkeypatch.setattr(train_domino, "load_hf_safetensors_state_dict", lambda _path: state_dict)
+
+    with pytest.raises(ValueError, match="embed_proj.2.weight"):
+        recipe._load_draft_init("partial-domino")
 
 
 def test_draft_without_projector_has_no_head():
@@ -195,6 +242,37 @@ def test_domino_sampling_uses_pure_prefix_then_causal_correction() -> None:
     torch.testing.assert_close(uncorrected, torch.tensor([[0, 0, 0]]))
 
 
+def test_domino_single_step_gru_matches_module() -> None:
+    """The inference-only GRU step preserves the trained module's recurrence."""
+    draft = _build_trainer().draft_model.eval()
+    token_embedding = torch.randn(3, 1, HIDDEN)
+    hidden_state = torch.randn(3, GRU_HIDDEN)
+
+    expected_output, expected_hidden = draft.prefix_gru(token_embedding, hidden_state.unsqueeze(0))
+    actual_output, actual_hidden = draft._domino_gru_step(token_embedding, hidden_state)
+
+    torch.testing.assert_close(actual_output, expected_output)
+    torch.testing.assert_close(actual_hidden, expected_hidden.squeeze(0))
+
+
+def test_unshifted_domino_preserves_dflash_first_proposal() -> None:
+    """A warm-started unshifted Domino head must not change DFlash offset 1."""
+    torch.manual_seed(31)
+    base = Qwen3DFlashDraftModel(_draft_config(projector_type=None)).eval()
+    domino = Qwen3DFlashDraftModel(_draft_config(pure_prefix=1, shift_label=False)).eval()
+    missing, unexpected = domino.load_state_dict(copy.deepcopy(base.state_dict()), strict=False)
+    assert missing and all(name.startswith(("prefix_gru.", "embed_proj.")) for name in missing)
+    assert not unexpected
+    target = _TinyDominoTarget(nn.Embedding(VOCAB, HIDDEN), nn.Linear(HIDDEN, VOCAB, bias=False)).eval()
+    draft_hidden = torch.randn(1, BLOCK_SIZE, HIDDEN)
+    block_ids = torch.tensor([[7, MASK_ID, MASK_ID, MASK_ID]])
+
+    base_suffix = base._sample_draft_tokens(target, draft_hidden, block_ids)
+    domino_suffix = domino._sample_draft_tokens(target, draft_hidden, block_ids)
+
+    torch.testing.assert_close(domino_suffix[:, :1], base_suffix[:, :1])
+
+
 def test_trainer_requires_domino_draft():
     draft = Qwen3DFlashDraftModel(_draft_config(projector_type=None))
     with pytest.raises(ValueError, match="projector_type='domino'"):
@@ -240,6 +318,32 @@ def test_forward_returns_metrics_and_grads_flow_to_head(shift_label):
     )
     assert gru_grad > 0
     assert proj_grad > 0
+
+
+def test_forward_supports_hard_mrope_positions() -> None:
+    """Domino must extend target positions to the parallel draft block."""
+    draft = Qwen3DFlashDraftModel(_draft_config(shift_label=False, spatial_rope=True))
+    trainer = DominoTrainerModule(
+        draft_model=draft,
+        target_lm_head=torch.nn.Linear(HIDDEN, VOCAB, bias=False),
+        target_embed_tokens=torch.nn.Embedding(VOCAB, HIDDEN),
+        mask_token_id=MASK_ID,
+        block_size=BLOCK_SIZE,
+        attention_backend="sdpa",
+        num_anchors=2,
+        shift_label=False,
+    )
+    input_ids, hidden, loss_mask = _inputs(bsz=1)
+    multimodal_position_ids = torch.arange(input_ids.shape[1]).view(1, 1, -1).expand(3, 1, -1)
+
+    output = trainer(
+        input_ids=input_ids,
+        hidden_states=hidden,
+        loss_mask=loss_mask,
+        multimodal_position_ids=multimodal_position_ids,
+    )
+
+    assert torch.isfinite(output.loss)
 
 
 def test_lambda_base_one_equals_base_loss():

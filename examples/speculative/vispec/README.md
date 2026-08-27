@@ -212,3 +212,11 @@ For example, run the complete ViSpec suite with:
 
 Use `--only scienceqa` (or another benchmark name) for a single-dataset run.
 Use `--no-fixed-output-length` only for an intentional EOS-terminated diagnostic.
+Use `--vispec-proposal-mode chain` for the no-tree ablation: the same ViSpec
+draft still rolls out three recursive steps, but only its top-1 continuation is
+retained at every depth.
+Use `--benchmark-suite legacy` to run the original GQA, TextVQA, COCO Caption,
+CharXiv Reasoning, and MMMU-Pro suite with the shared 256-token limit from
+`examples/speculative/bench_sweep/vlm_spec_bench_datasets_legacy_256.yaml`.
+The measured five-method comparison is recorded in
+[`qwen2_5_vl_legacy5_4x256_results.md`](../bench_sweep/qwen2_5_vl_legacy5_4x256_results.md).

@@ -1,0 +1,71 @@
+# Three-epoch pooled-MLP visual-conditioning experiment. Warm-start the trained
+# Qwen2.5-VL DFlash backbone and train only the zero-gated visual branch. Save
+# every epoch as consolidated safetensors so acceptance can select the best one.
+
+recipe: TrainDFlashRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: /data/models/Qwen2.5-VL-7B-Instruct
+  draft_init_from: checkpoints/epoch_6_step_14574/model/consolidated
+  output_dir: dflash_visual_mlp_3epoch
+  training_stage: visual_adaptor
+  num_epochs: 3
+
+  seq_length: 3072
+  image_min_pixels: 200704
+  image_max_pixels: 1003520
+  micro_batch_size: 28
+  grad_accumulation_steps: 1
+  num_workers: 4
+
+  draft_num_hidden_layers: 3
+  block_size: 8
+  num_anchors: 256
+  loss_decay_gamma: 7.0
+  mask_token_id: 151669
+  attention_backend: flex_attention
+  visual_num_query_tokens: 1
+  visual_adapter_type: pooled_mlp
+  visual_adapter_dim: 128
+
+  trust_remote_code: false
+  target_attn_implementation: sdpa
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  save_checkpoint_every_epoch: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
+  path_or_dataset: /data/datasets/vispec_qwen2_5_vl/stage2/meta.json
+  split: train
+
+optimizer:
+  lr: 1.0e-4
+  visual_lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.1
+
+compile:
+  enabled: true
+  mode: default
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: dflash_visual_mlp_3epoch_checkpoints
+  model_save_format: safetensors
+  save_consolidated: every
+  max_recent_checkpoints: 3
+
+wandb:
+  enable: false
+  project: dflash-qwen2-5-vl
+  name: qwen2-5-vl-dflash-visual-pooled-mlp-3epoch
+  mode: offline
+  dir: dflash_visual_mlp_3epoch/wandb

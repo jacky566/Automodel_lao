@@ -1,0 +1,111 @@
+{
+  "gqa": {
+    "target": "/data/models/Qwen2.5-VL-7B-Instruct",
+    "draft": "domino_checkpoints/epoch_6_step_14574/model/consolidated",
+    "mode": "dflash",
+    "num_prompts": 1,
+    "max_new_tokens": 256,
+    "fixed_output_length": true,
+    "benchmark_suite": "legacy",
+    "input_data": null,
+    "media_dir": null,
+    "input_start": null,
+    "baseline_results": null,
+    "target_parity_checked": false,
+    "block_size": null,
+    "draft_layers": null,
+    "visual_gate_multiplier": 1.0,
+    "draft_image_context_mode": "keep",
+    "attn_implementation": "sdpa",
+    "verification_mode": "block",
+    "vispec_depth": null,
+    "vispec_top_k": null,
+    "vispec_total_token": null,
+    "completed": 1,
+    "output_tokens": 256,
+    "wall_clock_s": 5.672420529881492,
+    "tok_s": 45.130645489245545,
+    "accept_length": 0.4463276836158192,
+    "emitted_tokens_per_step": 1.4463276836158192,
+    "acceptance_rate": 0.06523534269199009,
+    "position_acceptance_by_round_start": {
+      "1-32": {
+        "verify_steps": 11,
+        "accepted_tokens": 21,
+        "draft_tokens": 77,
+        "accept_length": 1.9090909090909092,
+        "emitted_tokens_per_step": 2.909090909090909,
+        "acceptance_rate": 0.2727272727272727
+      },
+      "33-64": {
+        "verify_steps": 17,
+        "accepted_tokens": 15,
+        "draft_tokens": 119,
+        "accept_length": 0.8823529411764706,
+        "emitted_tokens_per_step": 1.8823529411764706,
+        "acceptance_rate": 0.12605042016806722
+      },
+      "65-128": {
+        "verify_steps": 33,
+        "accepted_tokens": 31,
+        "draft_tokens": 231,
+        "accept_length": 0.9393939393939394,
+        "emitted_tokens_per_step": 1.9393939393939394,
+        "acceptance_rate": 0.1341991341991342
+      },
+      "129-256": {
+        "verify_steps": 116,
+        "accepted_tokens": 12,
+        "draft_tokens": 784,
+        "accept_length": 0.10344827586206896,
+        "emitted_tokens_per_step": 1.103448275862069,
+        "acceptance_rate": 0.015306122448979591
+      }
+    },
+    "proposal_offset_acceptance": {
+      "1": {
+        "opportunities": 176,
+        "accepted": 38,
+        "acceptance_rate": 0.2159090909090909
+      },
+      "2": {
+        "opportunities": 175,
+        "accepted": 30,
+        "acceptance_rate": 0.17142857142857143
+      },
+      "3": {
+        "opportunities": 174,
+        "accepted": 5,
+        "acceptance_rate": 0.028735632183908046
+      },
+      "4": {
+        "opportunities": 173,
+        "accepted": 4,
+        "acceptance_rate": 0.023121387283236993
+      },
+      "5": {
+        "opportunities": 172,
+        "accepted": 2,
+        "acceptance_rate": 0.011627906976744186
+      },
+      "6": {
+        "opportunities": 171,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      },
+      "7": {
+        "opportunities": 170,
+        "accepted": 0,
+        "acceptance_rate": 0.0
+      }
+    },
+    "exact_match_count": null,
+    "exact_match_rate": null,
+    "token_match_rate": null,
+    "mean_common_prefix_length": null,
+    "target_prefill_s": 0.057393985748291014,
+    "draft_s": 1.3610207333564759,
+    "target_verify_s": 4.07229935836792,
+    "unattributed_s": 0.18170645240880479
+  }
+}

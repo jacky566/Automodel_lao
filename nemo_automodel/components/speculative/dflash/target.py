@@ -28,6 +28,7 @@ from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 
@@ -38,6 +39,8 @@ class DFlashTargetBatch:
 
     ``position_ids`` / ``seq_lens`` / ``doc_remaining`` are ``None`` off the
     packing path and carry the (unshifted) packing metadata to the trainer on it.
+    ``image_mask`` is an optional bool tensor of shape [batch, sequence] marking
+    target image-placeholder positions for cached visual conditioning.
     """
 
     hidden_states: torch.Tensor  # [B, S, len(target_layer_ids) * H]
@@ -51,6 +54,12 @@ class DFlashTargetBatch:
     position_ids: Optional[torch.Tensor] = None
     seq_lens: Optional[torch.Tensor] = None
     doc_remaining: Optional[torch.Tensor] = None
+    # Bool tensor ``[B, S]`` identifying image-placeholder positions. It is
+    # populated only by multimodal wrappers with visual conditioning enabled.
+    image_mask: torch.Tensor | None = None
+    # Long tensor ``[3, B, S]`` containing temporal, height, and width positions.
+    # It is populated only when the multimodal wrapper is asked to capture it.
+    multimodal_position_ids: torch.Tensor | None = None
 
 
 class HFDFlashTargetModel:
@@ -242,6 +251,20 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
     passed to the draft itself.
     """
 
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer_ids: Sequence[int],
+        *,
+        capture_logits: bool = False,
+        cp_mesh: DeviceMesh | None = None,
+        image_token_id: int | None = None,
+        capture_multimodal_positions: bool = False,
+    ) -> None:
+        super().__init__(model, target_layer_ids, capture_logits=capture_logits, cp_mesh=cp_mesh)
+        self.image_token_id = image_token_id
+        self.capture_multimodal_positions = capture_multimodal_positions
+
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return the multimodal target's language decoder layers in order."""
         base_model = getattr(self.model, "model", None)
@@ -263,6 +286,7 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        second_per_grid_ts: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> DFlashTargetBatch:
@@ -277,6 +301,8 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
             image_grid_thw: Optional long tensor of shape [images, 3].
             pixel_values_videos: Optional video-patch tensor.
             video_grid_thw: Optional long tensor of shape [videos, 3].
+            second_per_grid_ts: Optional tensor of shape [videos] containing the
+                seconds represented by each temporal grid interval.
             mm_token_type_ids: Optional integer tensor of shape [batch,
                 sequence] identifying text and multimodal token positions.
             position_ids: Optional target-model position tensor. Qwen3-VL
@@ -285,7 +311,8 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
 
         Returns:
             A target batch whose ``hidden_states`` tensor has shape [batch,
-            sequence, captured_layers * hidden].
+            sequence, captured_layers * hidden] and whose optional ``image_mask``
+            tensor has shape [batch, sequence].
         """
         if self._cp_size > 1:
             raise NotImplementedError("Multimodal DFlash does not support context parallelism yet.")
@@ -307,6 +334,28 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
         extra_kwargs = {
             name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
         }
+        resolved_position_ids = position_ids
+        if self.capture_multimodal_positions:
+            position_builder = getattr(getattr(self.model, "model", None), "compute_3d_position_ids", None)
+            if not callable(position_builder):
+                raise ValueError("The multimodal target does not expose 3D position construction.")
+            if resolved_position_ids is None:
+                resolved_position_ids = position_builder(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    inputs_embeds=None,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    second_per_grid_ts=second_per_grid_ts,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
+            if resolved_position_ids is None or resolved_position_ids.ndim != 3 or resolved_position_ids.shape[0] != 3:
+                raise ValueError(
+                    "Spatial-rope training requires multimodal positions with shape [3, batch, sequence], "
+                    f"got {None if resolved_position_ids is None else tuple(resolved_position_ids.shape)}."
+                )
+
         multimodal_inputs = {
             name: value
             for name, value in {
@@ -314,8 +363,9 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
                 "image_grid_thw": image_grid_thw,
                 "pixel_values_videos": pixel_values_videos,
                 "video_grid_thw": video_grid_thw,
+                "second_per_grid_ts": second_per_grid_ts,
                 "mm_token_type_ids": mm_token_type_ids,
-                "position_ids": position_ids,
+                "position_ids": resolved_position_ids,
             }.items()
             if value is not None and name in forward_params
         }
@@ -333,6 +383,11 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
                 handle.remove()
 
         hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
+        image_mask = None
+        if self.image_token_id is not None:
+            image_mask = input_ids == self.image_token_id
+            if mm_token_type_ids is not None:
+                image_mask = image_mask | (mm_token_type_ids == 1)
         return DFlashTargetBatch(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -340,4 +395,6 @@ class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
             loss_mask=loss_mask,
             logits=logits,
             position_ids=position_ids,
+            image_mask=image_mask,
+            multimodal_position_ids=resolved_position_ids if self.capture_multimodal_positions else None,
         )

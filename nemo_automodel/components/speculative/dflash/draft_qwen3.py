@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import inspect
 from contextlib import AbstractContextManager, nullcontext
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, TypedDict
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
@@ -51,6 +52,49 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 
+class _DFlashAcceptanceEvent(TypedDict):
+    """Acceptance counters for one verification round."""
+
+    generated_position: int
+    accepted_tokens: int
+    draft_tokens: int
+
+
+class _DFlashGenerationStats(TypedDict):
+    """Counters and timings returned by speculative generation."""
+
+    draft_tokens: float
+    accepted_tokens: float
+    verify_steps: float
+    acceptance_events: list[_DFlashAcceptanceEvent]
+    target_prefill_seconds: float
+    draft_seconds: float
+    target_verify_seconds: float
+
+
+def _bounded_acceptance_counts(
+    *,
+    start: int,
+    max_length: int,
+    block_size: int,
+    acceptance_length: int,
+) -> tuple[int, int]:
+    """Clip proposal and acceptance counts to requested output positions.
+
+    Args:
+        start: Absolute sequence position of the verification-round anchor.
+        max_length: Exclusive maximum sequence length requested by the caller.
+        block_size: Number of tokens in the draft block, including its anchor.
+        acceptance_length: Number of draft tokens accepted by the target.
+
+    Returns:
+        Number of in-range draft opportunities and accepted draft tokens.
+    """
+    remaining_tokens = max(0, max_length - start)
+    draft_tokens = min(block_size - 1, max(0, remaining_tokens - 1))
+    return draft_tokens, min(acceptance_length, draft_tokens)
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     """Greedy (temperature ~ 0) or temperature sampling over the last dim."""
     if temperature < 1e-5:
@@ -59,6 +103,42 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits.view(-1, vocab_size) / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+def _ablate_image_token_hidden_states(
+    target_hidden: torch.Tensor,
+    image_mask: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """Transform image-token rows in target context for inference diagnostics.
+
+    Args:
+        target_hidden: Target features of shape [batch, sequence, hidden].
+        image_mask: Boolean image-token mask of shape [batch, sequence].
+        mode: ``keep`` preserves features, ``zero`` removes them, and
+            ``shuffle`` reverses their order independently in each sample.
+
+    Returns:
+        Target features with the requested image-token transformation.
+    """
+    if mode not in {"keep", "zero", "shuffle"}:
+        raise ValueError(f"image-token context mode must be keep, zero, or shuffle, got {mode!r}.")
+    if target_hidden.ndim != 3 or image_mask.shape != target_hidden.shape[:2]:
+        raise ValueError(
+            "image_mask must match the batch and sequence axes of target_hidden, "
+            f"got {tuple(image_mask.shape)} and {tuple(target_hidden.shape)}."
+        )
+    if mode == "keep":
+        return target_hidden
+
+    image_mask = image_mask.to(device=target_hidden.device, dtype=torch.bool)
+    transformed = target_hidden.clone()
+    if mode == "zero":
+        return transformed.masked_fill(image_mask.unsqueeze(-1), 0)
+    for batch_index in range(target_hidden.shape[0]):
+        image_indices = image_mask[batch_index].nonzero(as_tuple=True)[0]
+        transformed[batch_index, image_indices] = target_hidden[batch_index, image_indices.flip(0)]
+    return transformed
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -74,6 +154,44 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _merge_multiaxis_rotary_embeddings(
+    rotary_emb: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    sections: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one MRoPE table from temporal, height, and width positions.
+
+    Args:
+        rotary_emb: Rotary module producing tables for flattened position rows.
+        hidden_states: Tensor of shape [batch, tokens, hidden], used for dtype and device.
+        position_ids: Long tensor of shape [3, batch, sequence], with axes ordered as
+            temporal, height, and width.
+        sections: Number of half-head channels assigned to the three position axes.
+
+    Returns:
+        Cosine and sine tensors, each of shape [batch, sequence, head_dim].
+    """
+    if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+        raise ValueError(
+            f"multimodal_position_ids must have shape [3, batch, sequence], got {tuple(position_ids.shape)}."
+        )
+    axes, batch_size, sequence_length = position_ids.shape
+    flat_position_ids = position_ids.reshape(axes * batch_size, sequence_length)
+    axis_cos, axis_sin = rotary_emb(hidden_states, flat_position_ids)
+    axis_cos = axis_cos.reshape(axes, batch_size, sequence_length, -1)
+    axis_sin = axis_sin.reshape(axes, batch_size, sequence_length, -1)
+    split_sizes = sections * 2
+    if sum(split_sizes) != axis_cos.shape[-1]:
+        raise ValueError(
+            "Twice the sum of spatial_rope_sections must equal the attention head dimension, "
+            f"got sections={sections} and head_dim={axis_cos.shape[-1]}."
+        )
+    cos = torch.cat([chunk[index % 3] for index, chunk in enumerate(axis_cos.split(split_sizes, dim=-1))], dim=-1)
+    sin = torch.cat([chunk[index % 3] for index, chunk in enumerate(axis_sin.split(split_sizes, dim=-1))], dim=-1)
+    return cos, sin
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -115,10 +233,34 @@ class Qwen3DFlashAttention(nn.Module):
         target_hidden: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        multimodal_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        spatial_rope_gate: torch.Tensor | None = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Attend from draft tokens to target context and the draft block.
+
+        Args:
+            hidden_states: Tensor of shape [batch, draft_tokens, hidden].
+            target_hidden: Tensor of shape [batch, context_tokens, hidden].
+            position_embeddings: Tuple of cosine and sine tensors, each of shape
+                [batch, context_tokens + draft_tokens, head_dim], for baseline 1D RoPE.
+            multimodal_position_embeddings: Optional tuple of cosine and sine tensors,
+                each of shape [batch, context_tokens + draft_tokens, head_dim], for MRoPE.
+            spatial_rope_gate: Optional scalar tensor interpolating between baseline and
+                multimodal rotary outputs. When omitted with multimodal embeddings, MRoPE
+                replaces baseline RoPE directly.
+            attention_mask: Optional attention mask broadcastable to shape
+                [batch, heads, draft_tokens, context_tokens + draft_tokens].
+            past_key_values: Optional per-layer key/value cache.
+            cache_position: Optional long tensor containing cache write positions.
+            **kwargs: Attention backend arguments.
+
+        Returns:
+            Tuple containing the attention output tensor of shape [batch, draft_tokens,
+            hidden] and optional attention weights.
+        """
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
@@ -132,7 +274,23 @@ class Qwen3DFlashAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
+        unrotated_q, unrotated_k = q, k
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if multimodal_position_embeddings is not None:
+            spatial_cos, spatial_sin = multimodal_position_embeddings
+            spatial_q, spatial_k = apply_rotary_pos_emb(
+                unrotated_q,
+                unrotated_k,
+                spatial_cos,
+                spatial_sin,
+            )
+            if spatial_rope_gate is None:
+                q, k = spatial_q, spatial_k
+                cos, sin = spatial_cos, spatial_sin
+            else:
+                strength = torch.tanh(spatial_rope_gate).to(dtype=q.dtype)
+                q = q + strength * (spatial_q - q)
+                k = k + strength * (spatial_k - k)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
@@ -162,6 +320,233 @@ class Qwen3DFlashAttention(nn.Module):
         return self.o_proj(attn_output), attn_weights
 
 
+class DFlashVisualLayer(nn.Module):
+    """Compress one target layer's image tokens and fuse them into one draft layer.
+
+    Each draft layer owns its two-query resampler because it is paired with a
+    different captured target layer. The compressed context can be built once
+    during prefill and reused for every draft round.
+
+    Args:
+        config: Qwen draft configuration supplying the hidden size and RMSNorm epsilon.
+        num_query_tokens: Number of learned visual queries.
+        adapter_dim: Hidden size of the lightweight visual attention branch.
+        num_attention_heads: Number of visual attention heads.
+        gate_init: Initial scalar residual-gate value.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        num_query_tokens: int,
+        adapter_dim: int,
+        num_attention_heads: int,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        if num_query_tokens < 1:
+            raise ValueError(f"visual_num_query_tokens must be >= 1, got {num_query_tokens}.")
+        if num_attention_heads <= 0 or adapter_dim <= 0 or adapter_dim % num_attention_heads != 0:
+            raise ValueError(
+                "visual_adapter_dim must be positive and divisible by visual_num_attention_heads, "
+                f"got {adapter_dim} and {num_attention_heads}."
+            )
+        self.hidden_size = config.hidden_size
+        self.adapter_dim = adapter_dim
+        self.num_heads = num_attention_heads
+        self.head_dim = adapter_dim // num_attention_heads
+        self.num_query_tokens = num_query_tokens
+        self.query = nn.Parameter(torch.empty(num_query_tokens, self.num_heads, self.head_dim))
+        self.target_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.target_proj = nn.Linear(config.hidden_size, adapter_dim, bias=False)
+        self.resampler_k_proj = nn.Linear(adapter_dim, adapter_dim, bias=False)
+        self.resampler_v_proj = nn.Linear(adapter_dim, adapter_dim, bias=False)
+        self.resampler_o_proj = nn.Linear(adapter_dim, adapter_dim, bias=False)
+        self.draft_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_q_proj = nn.Linear(config.hidden_size, adapter_dim, bias=False)
+        self.cross_k_proj = nn.Linear(adapter_dim, adapter_dim, bias=False)
+        self.cross_v_proj = nn.Linear(adapter_dim, adapter_dim, bias=False)
+        self.cross_o_proj = nn.Linear(adapter_dim, config.hidden_size, bias=False)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        nn.init.normal_(self.query, mean=0.0, std=self.head_dim**-0.5)
+
+    def build_context(self, target_hidden: torch.Tensor, image_mask: torch.Tensor) -> torch.Tensor:
+        """Compress image-token features with learned queries.
+
+        Args:
+            target_hidden: Tensor of shape [batch, sequence, hidden] from the
+                target layer paired with this draft layer.
+            image_mask: Bool tensor of shape [batch, sequence], with True at
+                image-token positions.
+
+        Returns:
+            Tensor of shape [batch, visual_queries, visual_dim]. Samples without an
+            image receive an all-zero context.
+        """
+        if target_hidden.ndim != 3:
+            raise ValueError(f"target_hidden must have shape [batch, sequence, hidden], got {target_hidden.shape}.")
+        if image_mask.shape != target_hidden.shape[:2]:
+            raise ValueError(
+                "image_mask must have shape [batch, sequence] matching target_hidden, "
+                f"got {tuple(image_mask.shape)} and {tuple(target_hidden.shape)}."
+            )
+        batch_size, sequence_length, _ = target_hidden.shape
+        if sequence_length == 0:
+            raise ValueError("target_hidden must contain at least one sequence position.")
+        image_mask = image_mask.to(device=target_hidden.device, dtype=torch.bool)
+        has_image = image_mask.any(dim=-1)
+        # SDPA must not receive a fully-masked row. For text-only samples expose
+        # one harmless token, then zero the compressed result below.
+        safe_mask = image_mask.clone()
+        safe_mask[:, 0] |= ~has_image
+        features = self.target_proj(self.target_norm(target_hidden))
+        query = self.query.to(dtype=features.dtype).unsqueeze(0).expand(batch_size, -1, -1, -1)
+        query = query.transpose(1, 2)
+        key = self.resampler_k_proj(features).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+        value = self.resampler_v_proj(features).view(batch_size, sequence_length, self.num_heads, self.head_dim)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        compressed = F.scaled_dot_product_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            attn_mask=safe_mask[:, None, None, :],
+            is_causal=False,
+        )
+        compressed = compressed.transpose(1, 2).reshape(batch_size, self.num_query_tokens, self.adapter_dim)
+        compressed = self.resampler_o_proj(compressed)
+        return compressed * has_image[:, None, None].to(dtype=compressed.dtype)
+
+    def forward(self, hidden_states: torch.Tensor, visual_context: torch.Tensor) -> torch.Tensor:
+        """Apply gated cross-attention from draft tokens to cached visual queries.
+
+        Args:
+            hidden_states: Tensor of shape [batch, draft_tokens, hidden].
+            visual_context: Tensor of shape [batch, visual_queries, visual_dim].
+
+        Returns:
+            Tensor of shape [batch, draft_tokens, hidden]. The input is unchanged
+            when ``gate`` is exactly zero.
+        """
+        if hidden_states.ndim != 3 or visual_context.ndim != 3:
+            raise ValueError(
+                "hidden_states and visual_context must have shapes [batch, tokens, hidden], "
+                f"got {tuple(hidden_states.shape)} and {tuple(visual_context.shape)}."
+            )
+        if hidden_states.shape[0] != visual_context.shape[0] or hidden_states.shape[2] != self.hidden_size:
+            raise ValueError(
+                "visual_context must share hidden_states' batch and configured hidden size, "
+                f"got {tuple(hidden_states.shape)} and {tuple(visual_context.shape)}."
+            )
+        if visual_context.shape[2] != self.adapter_dim:
+            raise ValueError(
+                f"visual_context hidden dimension must be {self.adapter_dim}, got {visual_context.shape[2]}."
+            )
+        batch_size, draft_tokens, _ = hidden_states.shape
+        visual_tokens = visual_context.shape[1]
+        query = self.cross_q_proj(self.draft_norm(hidden_states)).view(
+            batch_size, draft_tokens, self.num_heads, self.head_dim
+        )
+        key = self.cross_k_proj(visual_context).view(batch_size, visual_tokens, self.num_heads, self.head_dim)
+        value = self.cross_v_proj(visual_context).view(batch_size, visual_tokens, self.num_heads, self.head_dim)
+        attended = F.scaled_dot_product_attention(
+            query.transpose(1, 2).contiguous(),
+            key.transpose(1, 2).contiguous(),
+            value.transpose(1, 2).contiguous(),
+            is_causal=False,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, draft_tokens, self.adapter_dim)
+        return hidden_states + torch.tanh(self.gate) * self.cross_o_proj(attended)
+
+
+class DFlashPooledMLPVisualLayer(nn.Module):
+    """Pool one target layer's image tokens and fuse them with a gated MLP.
+
+    The masked mean and target-side MLP run once during prefill. Each subsequent
+    draft round reuses the single cached visual vector and applies only a
+    bottleneck MLP to the draft tokens. The residual gate starts at zero so a
+    warm-started DFlash checkpoint initially preserves its original behavior.
+
+    Args:
+        config: Qwen draft configuration supplying the hidden size and RMSNorm epsilon.
+        adapter_dim: Hidden size of the target and draft bottleneck MLPs.
+    """
+
+    def __init__(self, config: Qwen3Config, adapter_dim: int) -> None:
+        super().__init__()
+        if adapter_dim <= 0:
+            raise ValueError(f"visual_adapter_dim must be positive, got {adapter_dim}.")
+        self.hidden_size = config.hidden_size
+        self.adapter_dim = adapter_dim
+        self.target_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.target_mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, adapter_dim, bias=False),
+            nn.SiLU(),
+            nn.Linear(adapter_dim, adapter_dim, bias=False),
+        )
+        self.draft_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.draft_proj = nn.Linear(config.hidden_size, adapter_dim, bias=False)
+        self.output_proj = nn.Linear(adapter_dim, config.hidden_size, bias=False)
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def build_context(self, target_hidden: torch.Tensor, image_mask: torch.Tensor) -> torch.Tensor:
+        """Build one cached visual vector with masked mean pooling and an MLP.
+
+        Args:
+            target_hidden: Tensor of shape [batch, sequence, hidden] from the
+                target layer paired with this draft layer.
+            image_mask: Bool tensor of shape [batch, sequence], with True at
+                image-token positions.
+
+        Returns:
+            Tensor of shape [batch, 1, visual_dim]. Samples without an image
+            receive an all-zero context.
+        """
+        if target_hidden.ndim != 3:
+            raise ValueError(f"target_hidden must have shape [batch, sequence, hidden], got {target_hidden.shape}.")
+        if image_mask.shape != target_hidden.shape[:2]:
+            raise ValueError(
+                "image_mask must have shape [batch, sequence] matching target_hidden, "
+                f"got {tuple(image_mask.shape)} and {tuple(target_hidden.shape)}."
+            )
+        if target_hidden.shape[1] == 0:
+            raise ValueError("target_hidden must contain at least one sequence position.")
+        image_mask = image_mask.to(device=target_hidden.device, dtype=torch.bool)
+        mask = image_mask.unsqueeze(-1).to(dtype=target_hidden.dtype)
+        count = mask.sum(dim=1).clamp_min(1.0)
+        pooled = (self.target_norm(target_hidden) * mask).sum(dim=1) / count
+        context = self.target_mlp(pooled).unsqueeze(1)
+        return context * image_mask.any(dim=-1)[:, None, None].to(dtype=context.dtype)
+
+    def forward(self, hidden_states: torch.Tensor, visual_context: torch.Tensor) -> torch.Tensor:
+        """Apply cached visual conditioning through a zero-gated bottleneck MLP.
+
+        Args:
+            hidden_states: Tensor of shape [batch, draft_tokens, hidden].
+            visual_context: Tensor of shape [batch, 1, visual_dim].
+
+        Returns:
+            Tensor of shape [batch, draft_tokens, hidden]. The input is unchanged
+            when ``gate`` is exactly zero.
+        """
+        if hidden_states.ndim != 3 or visual_context.ndim != 3:
+            raise ValueError(
+                "hidden_states and visual_context must have shapes [batch, tokens, hidden], "
+                f"got {tuple(hidden_states.shape)} and {tuple(visual_context.shape)}."
+            )
+        if hidden_states.shape[0] != visual_context.shape[0] or hidden_states.shape[2] != self.hidden_size:
+            raise ValueError(
+                "visual_context must share hidden_states' batch and configured hidden size, "
+                f"got {tuple(hidden_states.shape)} and {tuple(visual_context.shape)}."
+            )
+        if visual_context.shape[1:] != (1, self.adapter_dim):
+            raise ValueError(
+                f"visual_context must have shape [batch, 1, {self.adapter_dim}], got {tuple(visual_context.shape)}."
+            )
+        fused = F.silu(self.draft_proj(self.draft_norm(hidden_states)) + visual_context)
+        return hidden_states + torch.tanh(self.gate) * self.output_proj(fused)
+
+
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     """A DFlash decoder block: non-causal attention over ``[context | noise]`` + MLP."""
 
@@ -172,19 +557,67 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dflash_config = getattr(config, "dflash_config", {}) or {}
+        visual_num_query_tokens = int(dflash_config.get("visual_num_query_tokens", 0) or 0)
+        visual_adapter_type = str(dflash_config.get("visual_adapter_type", "cross_attention"))
+        if visual_num_query_tokens <= 0:
+            self.visual_fusion = None
+        elif visual_adapter_type == "cross_attention":
+            self.visual_fusion = DFlashVisualLayer(
+                config,
+                num_query_tokens=visual_num_query_tokens,
+                adapter_dim=int(dflash_config.get("visual_adapter_dim", 256)),
+                num_attention_heads=int(dflash_config.get("visual_num_attention_heads", 4)),
+                gate_init=float(dflash_config.get("visual_gate_init", 1.0e-3)),
+            )
+        elif visual_adapter_type == "pooled_mlp":
+            self.visual_fusion = DFlashPooledMLPVisualLayer(
+                config,
+                adapter_dim=int(dflash_config.get("visual_adapter_dim", 128)),
+            )
+        else:
+            raise ValueError(
+                f"visual_adapter_type must be 'cross_attention' or 'pooled_mlp', got {visual_adapter_type!r}."
+            )
 
     def forward(
         self,
-        target_hidden: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_hidden: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        multimodal_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        spatial_rope_gate: torch.Tensor | None = None,
+        visual_context: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run one DFlash layer with optional cached visual conditioning.
+
+        Args:
+            target_hidden: Tensor of shape [batch, context, hidden].
+            hidden_states: Tensor of shape [batch, draft_tokens, hidden].
+            attention_mask: Optional tensor or block mask describing attention
+                from draft tokens to [context, draft_tokens].
+            position_ids: Optional long tensor of shape [batch, context + draft_tokens].
+            past_key_value: Optional per-layer key/value cache.
+            use_cache: Whether to update ``past_key_value``.
+            cache_position: Optional long tensor containing cache write positions.
+            position_embeddings: Optional cosine and sine tensors with shape
+                [batch, context + draft_tokens, head_dim].
+            multimodal_position_embeddings: Optional MRoPE cosine and sine tensors
+                with shape [batch, context + draft_tokens, head_dim].
+            spatial_rope_gate: Optional scalar tensor interpolating between 1D RoPE
+                and MRoPE inside this layer's attention.
+            visual_context: Optional tensor of shape [batch, visual_queries, visual_dim].
+            **kwargs: HuggingFace attention backend arguments.
+
+        Returns:
+            Tensor of shape [batch, draft_tokens, hidden].
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -195,9 +628,15 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            multimodal_position_embeddings=multimodal_position_embeddings,
+            spatial_rope_gate=spatial_rope_gate,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
+        if self.visual_fusion is not None:
+            if visual_context is None:
+                raise ValueError("visual_context is required when DFlash visual conditioning is enabled.")
+            hidden_states = self.visual_fusion(hidden_states, visual_context)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -276,8 +715,39 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.spatial_rope_enabled = bool(dflash_config.get("spatial_rope_enabled", False))
+        self.spatial_rope_mode = str(dflash_config.get("spatial_rope_mode", "gated"))
+        spatial_rope_sections = dflash_config.get("spatial_rope_sections", None)
+        self.spatial_rope_sections = (
+            tuple(int(section) for section in spatial_rope_sections) if spatial_rope_sections is not None else ()
+        )
+        if self.spatial_rope_enabled:
+            if self.spatial_rope_mode not in {"gated", "replace"}:
+                raise ValueError(f"spatial_rope_mode must be 'gated' or 'replace', got {self.spatial_rope_mode!r}.")
+            head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+            if len(self.spatial_rope_sections) != 3 or 2 * sum(self.spatial_rope_sections) != head_dim:
+                raise ValueError(
+                    "Spatial-rope DFlash requires three spatial_rope_sections whose doubled sum equals head_dim, "
+                    f"got sections={self.spatial_rope_sections} and head_dim={head_dim}."
+                )
+            if self.spatial_rope_mode == "gated":
+                self.spatial_rope_gates = nn.Parameter(torch.zeros(len(self.layers)))
+            else:
+                self.register_parameter("spatial_rope_gates", None)
+        else:
+            self.register_parameter("spatial_rope_gates", None)
+        self.layer_routing_enabled = bool(dflash_config.get("layer_routing_enabled", False))
+        if self.layer_routing_enabled:
+            if len(self.target_layer_ids) != len(self.layers):
+                raise ValueError(
+                    "Layer-routed DFlash requires one captured target layer per draft layer, "
+                    f"got {len(self.target_layer_ids)} target layers and {len(self.layers)} draft layers."
+                )
+            self.layer_route_gates = nn.Parameter(torch.zeros(len(self.layers)))
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        self.visual_num_query_tokens = int(dflash_config.get("visual_num_query_tokens", 0) or 0)
+        self.visual_image_token_id = dflash_config.get("visual_image_token_id", None)
         # Optional Domino correction head (ported from SpecForge#571). DFlash drafts
         # a block in parallel and is non-causal; the Domino head adds a *causal*
         # low-rank logit correction conditioned on a GRU state built from the
@@ -304,6 +774,187 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         elif self.projector_type is not None:
             raise ValueError(f"Unknown draft projector_type: {self.projector_type}")
         self.post_init()
+
+    @property
+    def visual_conditioning_enabled(self) -> bool:
+        """Whether this checkpoint contains the cached visual-conditioning branch."""
+        return self.visual_num_query_tokens > 0
+
+    def set_training_stage(self, stage: str) -> None:
+        """Apply the supported two-stage visual-training freeze policy.
+
+        Args:
+            stage: ``"visual_adaptor"`` trains only the new visual modules;
+                ``"joint"`` trains the visual modules and existing DFlash backbone.
+        """
+        if stage not in {"visual_adaptor", "joint"}:
+            raise ValueError(f"training_stage must be 'visual_adaptor' or 'joint', got {stage!r}.")
+        if not self.visual_conditioning_enabled:
+            raise ValueError("A visual training stage requires visual_num_query_tokens > 0.")
+        self.requires_grad_(stage == "joint")
+        for layer in self.layers:
+            if layer.visual_fusion is not None:
+                layer.visual_fusion.requires_grad_(True)
+
+    def visual_parameters(self) -> list[nn.Parameter]:
+        """Return all parameters owned by the visual adaptor and fusion layers."""
+        parameters: list[nn.Parameter] = []
+        for layer in self.layers:
+            if layer.visual_fusion is not None:
+                parameters.extend(layer.visual_fusion.parameters())
+        return parameters
+
+    def set_domino_training_stage(self, stage: str) -> None:
+        """Freeze the DFlash backbone for head-only Domino warm-start training.
+
+        Args:
+            stage: ``"domino_head"`` trains only ``prefix_gru`` and
+                ``embed_proj``; ``"joint"`` trains the full draft.
+        """
+        if self.projector_type != "domino":
+            raise ValueError("A Domino training stage requires projector_type='domino'.")
+        if stage not in {"domino_head", "joint"}:
+            raise ValueError(f"Domino training_stage must be 'domino_head' or 'joint', got {stage!r}.")
+        self.requires_grad_(stage == "joint")
+        for parameter in self.domino_parameters():
+            parameter.requires_grad_(True)
+
+    def domino_parameters(self) -> list[nn.Parameter]:
+        """Return parameters owned by the Domino causal correction head."""
+        if self.projector_type != "domino":
+            return []
+        return [*self.prefix_gru.parameters(), *self.embed_proj.parameters()]
+
+    def set_layer_routing_training_stage(self, stage: str) -> None:
+        """Freeze the draft except for the layer-routing gates.
+
+        Args:
+            stage: ``"layer_routing"`` trains only the routing gates;
+                ``"joint"`` trains the full draft.
+        """
+        if not self.layer_routing_enabled:
+            raise ValueError("Layer-routing training requires layer_routing_enabled=true.")
+        if stage not in {"layer_routing", "joint"}:
+            raise ValueError(f"Layer-routing stage must be 'layer_routing' or 'joint', got {stage!r}.")
+        self.requires_grad_(stage == "joint")
+        self.layer_route_gates.requires_grad_(True)
+
+    def set_spatial_rope_training_stage(self, stage: str) -> None:
+        """Apply the configured MRoPE training policy.
+
+        Args:
+            stage: ``"spatial_rope"`` trains only the MRoPE gates; ``"joint"``
+                trains the full draft.
+        """
+        if not self.spatial_rope_enabled:
+            raise ValueError("Spatial-rope training requires spatial_rope_enabled=true.")
+        if stage not in {"spatial_rope", "joint"}:
+            raise ValueError(f"Spatial-rope stage must be 'spatial_rope' or 'joint', got {stage!r}.")
+        if self.spatial_rope_mode == "replace" and stage != "joint":
+            raise ValueError("spatial_rope_mode='replace' requires training_stage='joint'.")
+        self.requires_grad_(stage == "joint")
+        if self.spatial_rope_gates is not None:
+            self.spatial_rope_gates.requires_grad_(True)
+
+    def layer_routing_parameters(self) -> list[nn.Parameter]:
+        """Return the parameters controlling target-layer routing."""
+        if not self.layer_routing_enabled:
+            return []
+        return [self.layer_route_gates]
+
+    def _build_layer_contexts(self, target_hidden: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Build one target context per draft layer without changing sequence length.
+
+        Args:
+            target_hidden: Tensor of shape [batch, context, target_layers * hidden],
+                with captured target layers concatenated on the final axis.
+
+        Returns:
+            Tuple containing one tensor of shape [batch, context, hidden] per
+            draft layer. At zero routing gates every entry exactly follows the
+            original shared-context path.
+        """
+        shared_context = self.fc(target_hidden)
+        if not self.layer_routing_enabled:
+            normalized = self.hidden_norm(shared_context)
+            return (normalized,) * len(self.layers)
+
+        expected_hidden = len(self.target_layer_ids) * self.config.hidden_size
+        if target_hidden.shape[-1] != expected_hidden:
+            raise ValueError(
+                "Layer-routed target_hidden has the wrong final dimension: "
+                f"expected {expected_hidden}, got {target_hidden.shape[-1]}."
+            )
+        target_layers = target_hidden.split(self.config.hidden_size, dim=-1)
+        projection_slices = self.fc.weight.split(self.config.hidden_size, dim=1)
+        contexts = []
+        for layer_hidden, projection, route_gate in zip(
+            target_layers,
+            projection_slices,
+            self.layer_route_gates,
+        ):
+            routed_context = F.linear(layer_hidden, projection)
+            route_strength = torch.tanh(route_gate).to(dtype=shared_context.dtype)
+            mixed_context = shared_context + route_strength * (routed_context - shared_context)
+            contexts.append(self.hidden_norm(mixed_context))
+        return tuple(contexts)
+
+    def _domino_gru_step(
+        self,
+        token_embedding: torch.Tensor,
+        hidden_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate the bias-free Domino GRU for one token without cuDNN repacking."""
+        token_embedding = token_embedding.squeeze(1)
+        if hidden_state is None:
+            hidden_state = token_embedding.new_zeros((token_embedding.shape[0], self.gru_hidden_dim))
+        input_reset, input_update, input_new = F.linear(token_embedding, self.prefix_gru.weight_ih_l0).chunk(3, dim=-1)
+        hidden_reset, hidden_update, hidden_new = F.linear(hidden_state, self.prefix_gru.weight_hh_l0).chunk(3, dim=-1)
+        reset_gate = torch.sigmoid(input_reset + hidden_reset)
+        update_gate = torch.sigmoid(input_update + hidden_update)
+        new_gate = torch.tanh(input_new + reset_gate * hidden_new)
+        hidden_state = new_gate + update_gate * (hidden_state - new_gate)
+        return hidden_state.unsqueeze(1), hidden_state
+
+    def backbone_parameters(self) -> list[nn.Parameter]:
+        """Return existing DFlash parameters, excluding the visual branch."""
+        visual_ids = {id(parameter) for parameter in self.visual_parameters()}
+        return [parameter for parameter in self.parameters() if id(parameter) not in visual_ids]
+
+    def build_visual_context(
+        self,
+        target_hidden: torch.Tensor,
+        image_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Build one cached visual context per draft layer.
+
+        Args:
+            target_hidden: Tensor of shape [batch, sequence, target_layers * hidden],
+                concatenated in the same order as ``target_layer_ids``.
+            image_mask: Bool tensor of shape [batch, sequence], with True at
+                target image-token positions.
+
+        Returns:
+            Tuple with one tensor of shape [batch, visual_tokens, visual_dim] per
+            draft layer. ``visual_tokens`` is the learned-query count for the
+            cross-attention adaptor and one for the pooled-MLP adaptor. Entry ``i``
+            is computed only from target layer ``i``.
+        """
+        if not self.visual_conditioning_enabled:
+            return ()
+        expected_hidden = len(self.layers) * self.config.hidden_size
+        if target_hidden.shape[-1] != expected_hidden:
+            raise ValueError(
+                "Visual DFlash expects one target feature per draft layer: "
+                f"last dimension must be {expected_hidden}, got {target_hidden.shape[-1]}."
+            )
+        target_layers = target_hidden.split(self.config.hidden_size, dim=-1)
+        contexts = []
+        for layer, layer_target_hidden in zip(self.layers, target_layers):
+            if layer.visual_fusion is None:
+                raise RuntimeError("Visual DFlash layer is missing its visual fusion module.")
+            contexts.append(layer.visual_fusion.build_context(layer_target_hidden, image_mask))
+        return tuple(contexts)
 
     def _apply(self, fn, recurse=True):
         """Keep the RoPE ``inv_freq`` buffer in fp32 across dtype casts.
@@ -338,25 +989,71 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
     def forward(
         self,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool = False,
+        image_mask: torch.Tensor | None = None,
+        multimodal_position_ids: torch.Tensor | None = None,
+        visual_context: tuple[torch.Tensor, ...] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run the DFlash draft over target context and parallel noise blocks.
+
+        Args:
+            position_ids: Long tensor of shape [batch, context + draft_tokens].
+            attention_mask: Optional tensor or block mask describing attention
+                from draft tokens to [context, draft_tokens].
+            noise_embedding: Tensor of shape [batch, draft_tokens, hidden].
+            target_hidden: Tensor of shape [batch, context, target_layers * hidden].
+            past_key_values: Optional per-layer key/value cache.
+            use_cache: Whether to update ``past_key_values``.
+            image_mask: Optional bool tensor of shape [batch, context], with True
+                at image-token positions.
+            multimodal_position_ids: Optional long tensor of shape [3, batch,
+                context + draft_tokens], with temporal, height, and width positions.
+            visual_context: Optional tuple containing one tensor of shape [batch,
+                visual_queries, visual_dim] per draft layer.
+            **kwargs: HuggingFace attention backend arguments.
+
+        Returns:
+            Tensor of shape [batch, draft_tokens, hidden].
+        """
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        if self.visual_conditioning_enabled and visual_context is None:
+            if image_mask is None:
+                image_mask = torch.zeros(target_hidden.shape[:2], dtype=torch.bool, device=target_hidden.device)
+            visual_context = self.build_visual_context(target_hidden, image_mask)
+        layer_contexts = self._build_layer_contexts(target_hidden)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        multimodal_position_embeddings = None
+        if self.spatial_rope_enabled:
+            if multimodal_position_ids is None:
+                raise ValueError("multimodal_position_ids is required when spatial_rope_enabled=true.")
+            if tuple(multimodal_position_ids.shape[1:]) != tuple(position_ids.shape):
+                raise ValueError(
+                    "multimodal_position_ids must have shape [3, batch, sequence] matching position_ids, "
+                    f"got {tuple(multimodal_position_ids.shape)} and {tuple(position_ids.shape)}."
+                )
+            multimodal_position_embeddings = _merge_multiaxis_rotary_embeddings(
+                self.rotary_emb,
+                hidden_states,
+                multimodal_position_ids,
+                self.spatial_rope_sections,
+            )
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
+                target_hidden=layer_contexts[layer_idx],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                multimodal_position_embeddings=multimodal_position_embeddings,
+                spatial_rope_gate=(self.spatial_rope_gates[layer_idx] if self.spatial_rope_gates is not None else None),
+                visual_context=visual_context[layer_idx] if visual_context else None,
                 **kwargs,
             )
         return self.norm(hidden_states)
@@ -407,7 +1104,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
 
         for token_position in range(1, block_size):
             previous_token_ids = completed_ids[:, token_position - 1 : token_position]
-            prefix_state, gru_state = self.prefix_gru(target_embeddings(previous_token_ids), gru_state)
+            prefix_state, gru_state = self._domino_gru_step(target_embeddings(previous_token_ids), gru_state)
             head_position = token_position - 1 if self.shift_label else token_position
             next_token_logits = base_logits[:, head_position : head_position + 1, :]
             if head_position >= suffix_start:
@@ -431,7 +1128,9 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         target_kwargs: Optional[dict[str, torch.Tensor]] = None,
         return_stats: bool = False,
         sequential_target_verification: bool = False,
-    ) -> torch.LongTensor | tuple[torch.LongTensor, dict[str, float]]:
+        draft_image_context_mode: str = "keep",
+        draft_image_token_id: int | None = None,
+    ) -> torch.LongTensor | tuple[torch.LongTensor, _DFlashGenerationStats]:
         """Run block-parallel speculative decoding against a Transformers target.
 
         Args:
@@ -449,11 +1148,16 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             sequential_target_verification: Whether the target verifies draft
                 candidates one token at a time. This preserves parity with
                 ``generate()`` at the cost of target-side acceleration.
+            draft_image_context_mode: Diagnostic transformation applied only
+                to image-token rows entering the draft prompt cache.
+            draft_image_token_id: Image token id required when the diagnostic
+                mode is ``zero`` or ``shuffle``.
 
         Returns:
             Tensor of shape [1, prompt_tokens + generated_tokens]. When
             ``return_stats`` is true, returns that tensor and a dictionary of
-            scalar draft, accepted, and verification-step counts.
+            draft, accepted, verification-step, per-round position, and timing
+            statistics.
         """
         self.eval()
         num_input_tokens = input_ids.shape[1]
@@ -476,6 +1180,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         draft_tokens = 0
         accepted_tokens = 0
         verify_steps = 0
+        acceptance_events: list[_DFlashAcceptanceEvent] = []
         timing_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
             "target_prefill": [],
             "draft": [],
@@ -538,6 +1243,54 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
         target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+        draft_multimodal_position_ids = None
+        if self.spatial_rope_enabled:
+            if not target_is_vlm:
+                raise ValueError("Spatial-rope DFlash requires a target that exposes 3D position construction.")
+            prompt_multimodal_position_ids = target.model.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=target_kwargs.get("image_grid_thw"),
+                video_grid_thw=target_kwargs.get("video_grid_thw"),
+                inputs_embeds=None,
+                attention_mask=target_kwargs.get("attention_mask"),
+                past_key_values=None,
+                second_per_grid_ts=target_kwargs.get("second_per_grid_ts"),
+                mm_token_type_ids=target_kwargs.get("mm_token_type_ids"),
+            )
+            if prompt_multimodal_position_ids is None:
+                raise ValueError(
+                    "The target could not construct multimodal positions; image/video grid and token-type inputs "
+                    "must be present."
+                )
+            future_length = output_ids.shape[1] - num_input_tokens
+            future_offsets = torch.arange(
+                1,
+                future_length + 1,
+                device=prompt_multimodal_position_ids.device,
+                dtype=prompt_multimodal_position_ids.dtype,
+            ).view(1, 1, -1)
+            future_positions = prompt_multimodal_position_ids[:, :, -1:] + future_offsets
+            draft_multimodal_position_ids = torch.cat(
+                (prompt_multimodal_position_ids, future_positions),
+                dim=-1,
+            )
+        if draft_image_context_mode != "keep":
+            if draft_image_token_id is None:
+                raise ValueError("draft_image_token_id is required for image-token context ablation.")
+            draft_image_mask = input_ids == int(draft_image_token_id)
+            if not draft_image_mask.any():
+                raise ValueError("Image-token context ablation requires at least one image token in the prompt.")
+            target_hidden = _ablate_image_token_hidden_states(
+                target_hidden,
+                draft_image_mask,
+                draft_image_context_mode,
+            )
+        visual_context = None
+        if self.visual_conditioning_enabled:
+            if self.visual_image_token_id is None:
+                raise ValueError("visual_image_token_id is required for visual DFlash inference.")
+            image_mask = input_ids == int(self.visual_image_token_id)
+            visual_context = self.build_visual_context(target_hidden, image_mask)
 
         start = num_input_tokens
         while start < max_length:
@@ -549,8 +1302,14 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, past_key_values_draft.get_seq_length() : start + block_size],
+                multimodal_position_ids=(
+                    draft_multimodal_position_ids[:, :, past_key_values_draft.get_seq_length() : start + block_size]
+                    if draft_multimodal_position_ids is not None
+                    else None
+                ),
                 past_key_values=past_key_values_draft,
                 use_cache=True,
+                visual_context=visual_context,
             )
             block_output_ids[:, 1:] = self._sample_draft_tokens(
                 target,
@@ -559,7 +1318,6 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             )
             end_timing("draft", phase_start)
             past_key_values_draft.crop(start)
-            draft_tokens += int(block_output_ids.shape[1] - 1)
 
             if sequential_target_verification:
                 posterior_tokens: list[torch.Tensor] = []
@@ -612,10 +1370,13 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                             past_key_values=past_key_values_target,
                             mm_token_type_ids=None,
                         )
-                        verify_kwargs["position_ids"] = _prepend_text_position_ids(
-                            multimodal_position_ids,
-                            full_attention_mask,
-                        )[:, :, -1:]
+                        if multimodal_position_ids is not None:
+                            verify_kwargs["position_ids"] = _prepend_text_position_ids(
+                                multimodal_position_ids,
+                                full_attention_mask,
+                            )[:, :, -1:]
+                        else:
+                            verify_kwargs.pop("position_ids", None)
                         if "cache_position" in target_forward_params:
                             verify_kwargs["cache_position"] = torch.tensor(
                                 [start + block_index],
@@ -694,10 +1455,13 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                     past_key_values=past_key_values_target,
                     mm_token_type_ids=None,
                 )
-                verify_kwargs["position_ids"] = _prepend_text_position_ids(
-                    multimodal_position_ids,
-                    full_attention_mask,
-                )[:, :, -block_output_ids.shape[1] :]
+                if multimodal_position_ids is not None:
+                    verify_kwargs["position_ids"] = _prepend_text_position_ids(
+                        multimodal_position_ids,
+                        full_attention_mask,
+                    )[:, :, -block_output_ids.shape[1] :]
+                else:
+                    verify_kwargs.pop("position_ids", None)
                 if "cache_position" in target_forward_params:
                     verify_kwargs["cache_position"] = torch.arange(
                         start,
@@ -721,8 +1485,22 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 posterior = sample(output.logits, temperature)
                 acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
                 verified_target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
-            accepted_tokens += int(acceptance_length)
+            round_draft_tokens, round_accepted_tokens = _bounded_acceptance_counts(
+                start=start,
+                max_length=max_length,
+                block_size=block_output_ids.shape[1],
+                acceptance_length=int(acceptance_length),
+            )
+            draft_tokens += round_draft_tokens
+            accepted_tokens += round_accepted_tokens
             verify_steps += 1
+            acceptance_events.append(
+                {
+                    "generated_position": start - num_input_tokens + 1,
+                    "accepted_tokens": round_accepted_tokens,
+                    "draft_tokens": round_draft_tokens,
+                }
+            )
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
@@ -753,5 +1531,6 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             "draft_tokens": float(draft_tokens),
             "accepted_tokens": float(accepted_tokens),
             "verify_steps": float(verify_steps),
+            "acceptance_events": acceptance_events,
             **timing_seconds,
         }
